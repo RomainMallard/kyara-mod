@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Mod
 // @namespace    kyara-mod
-// @version      0.6.2
+// @version      0.8.0
 // @description  UI tweaks for kyara.games, toggleable from the profile menu.
 // @match        https://kyara.games/*
 // @match        file:///*Kyara*
@@ -342,9 +342,72 @@
     };
   })();
 
+  // --- Feature: hide trade tiles under x2 -----------------------------------
+
+  const tradeDoubles = (() => {
+    const BTN_ATTR = 'data-kmod-dbl';
+    const HIDE_CLASS = 'kmod-hide';
+    let active = false; // remembered across dialog opens until page reload
+
+    function qty(tile) {
+      const m = (tile.querySelector('.qty')?.textContent || '').match(/(\d+)/);
+      return m ? Number(m[1]) : 0;
+    }
+
+    function ensureStyle() {
+      if (document.getElementById('kmod-style-dbl')) return;
+      const style = document.createElement('style');
+      style.id = 'kmod-style-dbl';
+      style.textContent = `.builder .grid .tile.${HIDE_CLASS}{display:none!important}`;
+      document.head.append(style);
+    }
+
+    // Clone the site's "Échangeables" toggle so ours gets the same look.
+    function ensureButton() {
+      const filters = document.querySelector('.builder .filters');
+      if (!filters || filters.querySelector(`[${BTN_ATTR}]`)) return;
+      const siteToggle = filters.querySelector('button.toggle:not([' + BTN_ATTR + '])');
+      const btn = siteToggle ? siteToggle.cloneNode(false) : document.createElement('button');
+      btn.type = 'button';
+      btn.setAttribute(BTN_ATTR, '1');
+      btn.textContent = 'Doubles ×2+';
+      btn.setAttribute('aria-pressed', String(active));
+      btn.classList.toggle('on', active);
+      btn.addEventListener('click', () => {
+        active = !active;
+        btn.setAttribute('aria-pressed', String(active));
+        btn.classList.toggle('on', active);
+        apply();
+      });
+      if (siteToggle) siteToggle.after(btn);
+      else filters.append(btn);
+    }
+
+    function apply() {
+      for (const tile of document.querySelectorAll('.builder .grid .tile')) {
+        tile.classList.toggle(HIDE_CLASS, active && qty(tile) < 2);
+      }
+    }
+
+    return {
+      id: 'tradeDoubles',
+      label: 'trade: doubles filter',
+      start: ensureStyle,
+      tick() {
+        ensureButton();
+        apply(); // re-run: Svelte swaps tiles on tab change / search
+      },
+      stop() {
+        document.querySelectorAll(`[${BTN_ATTR}]`).forEach((b) => b.remove());
+        document.querySelectorAll(`.${HIDE_CLASS}`).forEach((t) => t.classList.remove(HIDE_CLASS));
+        document.getElementById('kmod-style-dbl')?.remove();
+      },
+    };
+  })();
+
   // --- Feature registry & settings -----------------------------------------
 
-  const FEATURES = [priceSort, bgFix, wishlist];
+  const FEATURES = [priceSort, bgFix, wishlist, tradeDoubles];
   const STORAGE_KEY = 'kmod:features';
   const running = new Set();
 
