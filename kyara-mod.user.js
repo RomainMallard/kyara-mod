@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Mod
 // @namespace    kyara-mod
-// @version      0.4.0
+// @version      0.5.0
 // @description  UI tweaks for kyara.games, toggleable from the profile menu.
 // @match        https://kyara.games/*
 // @match        file:///*Kyara*
@@ -175,9 +175,65 @@
     };
   })();
 
+  // --- Feature: greyed-out portrait behind missing cards --------------------
+
+  const bgFix = (() => {
+    const IMG_ATTR = 'data-kmod-bg';
+    const FILTER = 'grayscale() brightness(.45) blur(2px)'; // site's locked-card look
+
+    function decorate(miss) {
+      const slot = miss.closest('a.slot');
+      const id = slot && (slot.getAttribute('href') || '').match(/\/wiki\/(\d+)/)?.[1];
+      if (!id) return;
+
+      const img = document.createElement('img');
+      img.setAttribute(IMG_ATTR, '1');
+      img.alt = '';
+      img.loading = 'lazy';
+      img.decoding = 'async';
+      img.src = `/cards/lg/${id}.webp`;
+      img.style.cssText =
+        `position:absolute;inset:0;width:100%;height:100%;object-fit:cover;` +
+        `filter:${FILTER};z-index:0;pointer-events:none;`;
+      // Fall back to plain "?"; the data-kmod-bg mark on div.miss stops retries.
+      img.addEventListener('error', () => img.remove());
+
+      miss.setAttribute(IMG_ATTR, '1');
+      miss.style.position = 'relative';
+      miss.style.overflow = 'hidden';
+      for (const child of miss.children) {
+        child.style.position = 'relative';
+        child.style.zIndex = '1';
+      }
+      miss.prepend(img);
+    }
+
+    return {
+      id: 'bgFix',
+      label: 'bckgrd fix',
+      tick() {
+        for (const miss of document.querySelectorAll('a.slot div.miss')) {
+          if (!miss.hasAttribute(IMG_ATTR)) decorate(miss);
+        }
+      },
+      stop() {
+        for (const miss of document.querySelectorAll(`div.miss[${IMG_ATTR}]`)) {
+          miss.querySelector(`img[${IMG_ATTR}]`)?.remove();
+          miss.removeAttribute(IMG_ATTR);
+          miss.style.position = '';
+          miss.style.overflow = '';
+          for (const child of miss.children) {
+            child.style.position = '';
+            child.style.zIndex = '';
+          }
+        }
+      },
+    };
+  })();
+
   // --- Feature registry & settings -----------------------------------------
 
-  const FEATURES = [priceSort];
+  const FEATURES = [priceSort, bgFix];
   const STORAGE_KEY = 'kmod:features';
   const running = new Set();
 
