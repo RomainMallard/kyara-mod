@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Mod
 // @namespace    kyara-mod
-// @version      0.8.0
+// @version      0.9.0
 // @description  UI tweaks for kyara.games, toggleable from the profile menu.
 // @match        https://kyara.games/*
 // @match        file:///*Kyara*
@@ -342,72 +342,83 @@
     };
   })();
 
-  // --- Feature: hide trade tiles under x2 -----------------------------------
+  // --- Feature: trade utils (dialog filters: doubles, missing) ---------------
 
-  const tradeDoubles = (() => {
-    const BTN_ATTR = 'data-kmod-dbl';
+  const tradeUtils = (() => {
+    const BTN_ATTR = 'data-kmod-tf';
     const HIDE_CLASS = 'kmod-hide';
-    let active = false; // remembered across dialog opens until page reload
 
     function qty(tile) {
       const m = (tile.querySelector('.qty')?.textContent || '').match(/(\d+)/);
       return m ? Number(m[1]) : 0;
     }
 
+    // keep(tile) -> false hides it. A tile shows only if every active filter keeps it.
+    // `active` is remembered across dialog opens until page reload.
+    const FILTERS = [
+      { key: 'dbl', label: 'Doubles ×2+', active: false, keep: (t) => qty(t) >= 2 },
+      { key: 'miss', label: 'Manquantes', active: false, keep: (t) => !!t.querySelector('.flag.f-miss') },
+    ];
+
     function ensureStyle() {
-      if (document.getElementById('kmod-style-dbl')) return;
+      if (document.getElementById('kmod-style-tf')) return;
       const style = document.createElement('style');
-      style.id = 'kmod-style-dbl';
+      style.id = 'kmod-style-tf';
       style.textContent = `.builder .grid .tile.${HIDE_CLASS}{display:none!important}`;
       document.head.append(style);
     }
 
-    // Clone the site's "Échangeables" toggle so ours gets the same look.
-    function ensureButton() {
+    // Clone the site's "Échangeables" toggle so ours get the same look.
+    function ensureButtons() {
       const filters = document.querySelector('.builder .filters');
       if (!filters || filters.querySelector(`[${BTN_ATTR}]`)) return;
-      const siteToggle = filters.querySelector('button.toggle:not([' + BTN_ATTR + '])');
-      const btn = siteToggle ? siteToggle.cloneNode(false) : document.createElement('button');
-      btn.type = 'button';
-      btn.setAttribute(BTN_ATTR, '1');
-      btn.textContent = 'Doubles ×2+';
-      btn.setAttribute('aria-pressed', String(active));
-      btn.classList.toggle('on', active);
-      btn.addEventListener('click', () => {
-        active = !active;
-        btn.setAttribute('aria-pressed', String(active));
-        btn.classList.toggle('on', active);
-        apply();
-      });
-      if (siteToggle) siteToggle.after(btn);
-      else filters.append(btn);
+      const siteToggle = filters.querySelector(`button.toggle:not([${BTN_ATTR}])`);
+      let anchor = siteToggle;
+      for (const f of FILTERS) {
+        const btn = siteToggle ? siteToggle.cloneNode(false) : document.createElement('button');
+        btn.type = 'button';
+        btn.setAttribute(BTN_ATTR, f.key);
+        btn.textContent = f.label;
+        btn.setAttribute('aria-pressed', String(f.active));
+        btn.classList.toggle('on', f.active);
+        btn.addEventListener('click', () => {
+          f.active = !f.active;
+          btn.setAttribute('aria-pressed', String(f.active));
+          btn.classList.toggle('on', f.active);
+          apply();
+        });
+        if (anchor) anchor.after(btn);
+        else filters.append(btn);
+        anchor = btn;
+      }
     }
 
     function apply() {
+      const on = FILTERS.filter((f) => f.active);
       for (const tile of document.querySelectorAll('.builder .grid .tile')) {
-        tile.classList.toggle(HIDE_CLASS, active && qty(tile) < 2);
+        tile.classList.toggle(HIDE_CLASS, on.some((f) => !f.keep(tile)));
       }
     }
 
     return {
-      id: 'tradeDoubles',
-      label: 'trade: doubles filter',
+      id: 'tradeUtils',
+      label: 'trade utils',
       start: ensureStyle,
       tick() {
-        ensureButton();
+        ensureButtons();
         apply(); // re-run: Svelte swaps tiles on tab change / search
       },
       stop() {
         document.querySelectorAll(`[${BTN_ATTR}]`).forEach((b) => b.remove());
         document.querySelectorAll(`.${HIDE_CLASS}`).forEach((t) => t.classList.remove(HIDE_CLASS));
-        document.getElementById('kmod-style-dbl')?.remove();
+        document.getElementById('kmod-style-tf')?.remove();
       },
     };
   })();
 
   // --- Feature registry & settings -----------------------------------------
 
-  const FEATURES = [priceSort, bgFix, wishlist, tradeDoubles];
+  const FEATURES = [priceSort, bgFix, wishlist, tradeUtils];
   const STORAGE_KEY = 'kmod:features';
   const running = new Set();
 
