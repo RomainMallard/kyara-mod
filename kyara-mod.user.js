@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Mod
 // @namespace    kyara-mod
-// @version      0.9.0
+// @version      0.10.0
 // @description  UI tweaks for kyara.games, toggleable from the profile menu.
 // @match        https://kyara.games/*
 // @match        file:///*Kyara*
@@ -16,6 +16,18 @@
   // --- Shared helpers -------------------------------------------------------
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // The site authenticates API calls with a bearer token kept in localStorage.
+  // Read it per request so a refreshed token is picked up.
+  function api(path, method = 'GET') {
+    let token = null;
+    try {
+      token = localStorage.getItem('kyara_token');
+      if (token && token.startsWith('"')) token = JSON.parse(token);
+    } catch {}
+    if (!token) return Promise.reject(new Error('no kyara_token (logged out?)'));
+    return fetch(path, { method, headers: { Authorization: `Bearer ${token}` } });
+  }
 
   function findTriSelect() {
     for (const label of document.querySelectorAll('label')) {
@@ -245,18 +257,6 @@
     let generation = 0; // bumps on stop() so late responses are ignored
     const pending = new Set();
 
-    // The site authenticates API calls with a bearer token kept in localStorage.
-    // Read it per request so a refreshed token is picked up.
-    function api(path, method = 'GET') {
-      let token = null;
-      try {
-        token = localStorage.getItem('kyara_token');
-        if (token && token.startsWith('"')) token = JSON.parse(token);
-      } catch {}
-      if (!token) return Promise.reject(new Error('no kyara_token (logged out?)'));
-      return fetch(path, { method, headers: { Authorization: `Bearer ${token}` } });
-    }
-
     const cardId = (slot) => (slot.getAttribute('href') || '').match(/\/wiki\/(\d+)/)?.[1];
 
     function paint(btn) {
@@ -416,9 +416,172 @@
     };
   })();
 
+  // --- Feature: rarity frame on trade board cards ----------------------------
+
+  const boardFrames = (() => {
+    const ATTR = 'data-kmod-frame';
+    const SEL = 'ul.offers a.big > img, ul.offers a.thumb > img';
+
+    // The site paints the rarity as an inset box-shadow on the <img>, which the
+    // image itself covers. Reuse that colour as a padded background on the link.
+    // Site dims unowned thumbs with opacity (our frame would bleed through) and
+    // outlines owned ones on the <img> (drawn over our frame). Swap to a
+    // brightness dim and move the outline onto the framed link.
+    function ensureStyle() {
+      if (document.getElementById('kmod-style-frame')) return;
+      const style = document.createElement('style');
+      style.id = 'kmod-style-frame';
+      style.textContent =
+        `ul.offers a[${ATTR}] > img{opacity:1!important;outline:none!important}` +
+        `ul.offers a.thumb[${ATTR}]:not(.have) > img{filter:brightness(.5)}` +
+        `ul.offers a.thumb.have[${ATTR}]{outline:2px solid var(--U);outline-offset:1px}`;
+      document.head.append(style);
+    }
+
+    function decorate(img) {
+      const color = img.style.boxShadow.match(/rgba?\([^)]*\)|#[0-9a-f]{3,8}/i)?.[0];
+      if (!color) return;
+      const a = img.parentElement;
+      const radius = parseFloat(getComputedStyle(img).borderRadius) || 0;
+      a.setAttribute(ATTR, '1');
+      a.style.background = color;
+      a.style.padding = '3px';
+      a.style.borderRadius = `${radius + 3}px`;
+      a.style.display = 'block';
+      img.setAttribute(ATTR, img.style.boxShadow);
+    }
+
+    return {
+      id: 'boardFrames',
+      label: 'couleurs rareté (échanges)',
+      start: ensureStyle,
+      tick() {
+        for (const img of document.querySelectorAll(SEL)) {
+          // Svelte may reuse an <img> for another card: redo when the shadow changes.
+          if (img.getAttribute(ATTR) !== img.style.boxShadow) decorate(img);
+        }
+      },
+      stop() {
+        document.getElementById('kmod-style-frame')?.remove();
+        for (const el of document.querySelectorAll(`[${ATTR}]`)) {
+          el.removeAttribute(ATTR);
+          if (el.tagName === 'A') {
+            el.style.background = el.style.padding = el.style.borderRadius = el.style.display = '';
+          }
+        }
+      },
+    };
+  })();
+
+  // --- Feature: owned qty on trade board + "doubles to give" filter --------
+
+  const boardQty = (() => {
+    const BADGE_ATTR = 'data-kmod-qty';
+    const BTN_ATTR = 'data-kmod-bq';
+    const HIDE_CLASS = 'kmod-hide-offer';
+    const REFRESH_TICKS = 60; // re-fetch the collection about once a minute
+    let qtys = null; // Map characterId -> qty; null until loaded
+    let ticks = 0;
+    let generation = 0;
+    let onlyDoubles = false; // remembered until page reload
+
+    async function load() {
+      const gen = generation;
+      try {
+        const res = await api('/api/me/collection?lean=1');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        // Expect an array; tolerate it being wrapped in an object.
+        const list = Array.isArray(data) ? data : Object.values(data).find(Array.isArray) || [];
+        if (gen === generation) qtys = new Map(list.map((c) => [Number(c.characterId), c.qty || 0]));
+      } catch (err) {
+        console.warn('[kyara-mod] collection fetch failed', err);
+      }
+    }
+
+    const qtyOf = (a) => qtys.get(Number((a.getAttribute('href') || '').match(/\/wiki\/(\d+)/)?.[1])) || 0;
+
+    function ensureStyle() {
+      if (document.getElementById('kmod-style-bq')) return;
+      const style = document.createElement('style');
+      style.id = 'kmod-style-bq';
+      style.textContent =
+        `ul.offers li.offer.${HIDE_CLASS}{display:none!important}` +
+        `ul.offers a.thumb{position:relative}` +
+        `ul.offers [${BADGE_ATTR}]{position:absolute;top:-6px;right:-6px;z-index:1;` +
+        `font-family:var(--mono);font-size:10px;line-height:1;padding:2px 5px;` +
+        `border-radius:999px;background:var(--fg);color:var(--bg);pointer-events:none}`;
+      document.head.append(style);
+    }
+
+    function ensureButton() {
+      const filters = document.querySelector('section.board .filters');
+      if (!filters || filters.querySelector(`[${BTN_ATTR}]`)) return;
+      const sitePill = filters.querySelector(`button.pill:not([${BTN_ATTR}])`);
+      const btn = sitePill ? sitePill.cloneNode(false) : document.createElement('button');
+      btn.type = 'button';
+      btn.setAttribute(BTN_ATTR, '1');
+      btn.textContent = 'Doubles à donner';
+      btn.title = 'Masquer les offres où tu n’as aucune carte demandée en ×2 ou plus';
+      btn.setAttribute('aria-pressed', String(onlyDoubles));
+      btn.classList.toggle('on', onlyDoubles);
+      btn.addEventListener('click', () => {
+        onlyDoubles = !onlyDoubles;
+        btn.setAttribute('aria-pressed', String(onlyDoubles));
+        btn.classList.toggle('on', onlyDoubles);
+        apply();
+      });
+      filters.append(btn);
+    }
+
+    function apply() {
+      for (const a of document.querySelectorAll('ul.offers a.thumb')) {
+        const n = qtyOf(a);
+        let badge = a.querySelector(`[${BADGE_ATTR}]`);
+        if (!n) {
+          badge?.remove();
+          continue;
+        }
+        if (!badge) {
+          badge = document.createElement('span');
+          badge.setAttribute(BADGE_ATTR, '1');
+          a.append(badge);
+        }
+        if (badge.textContent !== `×${n}`) badge.textContent = `×${n}`;
+      }
+      for (const li of document.querySelectorAll('ul.offers li.offer')) {
+        const hide = onlyDoubles && ![...li.querySelectorAll('a.thumb')].some((a) => qtyOf(a) >= 2);
+        li.classList.toggle(HIDE_CLASS, hide);
+      }
+    }
+
+    return {
+      id: 'boardQty',
+      label: 'quantités (échanges)',
+      start() {
+        ensureStyle();
+        ticks = 0;
+        load();
+      },
+      tick() {
+        if (++ticks % REFRESH_TICKS === 0) load(); // pick up trades / boosters
+        if (!qtys) return;
+        ensureButton();
+        apply(); // re-run: Svelte re-renders offers on search / filter
+      },
+      stop() {
+        generation++;
+        qtys = null;
+        document.querySelectorAll(`[${BADGE_ATTR}], [${BTN_ATTR}]`).forEach((el) => el.remove());
+        document.querySelectorAll(`.${HIDE_CLASS}`).forEach((el) => el.classList.remove(HIDE_CLASS));
+        document.getElementById('kmod-style-bq')?.remove();
+      },
+    };
+  })();
+
   // --- Feature registry & settings -----------------------------------------
 
-  const FEATURES = [priceSort, bgFix, wishlist, tradeUtils];
+  const FEATURES = [priceSort, bgFix, wishlist, tradeUtils, boardFrames, boardQty];
   const STORAGE_KEY = 'kmod:features';
   const running = new Set();
 
