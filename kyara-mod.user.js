@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Mod
 // @namespace    kyara-mod
-// @version      0.5.0
+// @version      0.5.1
 // @description  UI tweaks for kyara.games, toggleable from the profile menu.
 // @match        https://kyara.games/*
 // @match        file:///*Kyara*
@@ -191,7 +191,7 @@
       img.alt = '';
       img.loading = 'lazy';
       img.decoding = 'async';
-      img.src = `/cards/lg/${id}.webp`;
+      img.src = `/cards/sm/${id}.webp`; // same size the site uses for owned cards
       img.style.cssText =
         `position:absolute;inset:0;width:100%;height:100%;object-fit:cover;` +
         `filter:${FILTER};z-index:0;pointer-events:none;`;
