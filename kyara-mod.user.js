@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Mod
 // @namespace    kyara-mod
-// @version      0.10.0
+// @version      0.11.0
 // @description  UI tweaks for kyara.games, toggleable from the profile menu.
 // @match        https://kyara.games/*
 // @match        file:///*Kyara*
@@ -579,9 +579,146 @@
     };
   })();
 
+  // --- Feature: hide completed albums ---------------------------------------
+
+  const albumsHide = (() => {
+    const BTN_ATTR = 'data-kmod-ah';
+    const HIDE_CLASS = 'kmod-hide-album';
+    const MIN_VISIBLE = 60; // the site's page size
+    let active = false; // remembered until page reload
+    let filling = false;
+
+    function ensureStyle() {
+      if (document.getElementById('kmod-style-ah')) return;
+      const style = document.createElement('style');
+      style.id = 'kmod-style-ah';
+      style.textContent = `ul.albums > li.${HIDE_CLASS}{display:none!important}`;
+      document.head.append(style);
+    }
+
+    // Clone the site's sort group so the toggle gets the same look.
+    function ensureButton() {
+      const tools = document.querySelector('.al-tools');
+      if (!tools || tools.querySelector(`[${BTN_ATTR}]`)) return;
+      const siteGroup = tools.querySelector('.views');
+      const group = siteGroup ? siteGroup.cloneNode(false) : document.createElement('div');
+      group.setAttribute(BTN_ATTR, '1');
+      group.removeAttribute('aria-label');
+      const siteBtn = siteGroup?.querySelector('button');
+      const btn = siteBtn ? siteBtn.cloneNode(false) : document.createElement('button');
+      btn.type = 'button';
+      btn.textContent = 'Masquer complets';
+      btn.setAttribute('aria-pressed', String(active));
+      btn.addEventListener('click', () => {
+        active = !active;
+        btn.setAttribute('aria-pressed', String(active));
+        apply();
+        fill();
+      });
+      group.append(btn);
+      tools.append(group);
+    }
+
+    function apply() {
+      for (const li of document.querySelectorAll('ul.albums > li')) {
+        li.classList.toggle(HIDE_CLASS, active && !!li.querySelector('.album .done'));
+      }
+    }
+
+    const countAlbums = () => document.querySelectorAll('ul.albums > li').length;
+    const countVisible = () => document.querySelectorAll(`ul.albums > li:not(.${HIDE_CLASS})`).length;
+    const moreButton = () => document.querySelector('ul.albums ~ .more button');
+
+    // Hidden albums leave the page short, and the site only loads more on click:
+    // keep clicking "Afficher plus" until a page's worth is visible again.
+    async function fill() {
+      if (filling) return;
+      filling = true;
+      try {
+        let btn;
+        while (active && countVisible() < MIN_VISIBLE && (btn = moreButton())) {
+          const before = countAlbums();
+          btn.click();
+          let grew = false;
+          for (let t = 0; t < 5000 && !grew; t += 100) {
+            await sleep(100);
+            grew = countAlbums() > before;
+          }
+          if (!grew) break; // nothing came, stop
+          apply();
+        }
+      } finally {
+        filling = false;
+      }
+    }
+
+    return {
+      id: 'albumsHide',
+      label: 'masquer albums complets',
+      start: ensureStyle,
+      tick() {
+        ensureButton();
+        apply(); // re-run: Svelte re-renders on sort / search
+        if (active) fill(); // sort / search resets the list to one page
+      },
+      stop() {
+        document.querySelectorAll(`[${BTN_ATTR}]`).forEach((el) => el.remove());
+        document.querySelectorAll(`.${HIDE_CLASS}`).forEach((el) => el.classList.remove(HIDE_CLASS));
+        document.getElementById('kmod-style-ah')?.remove();
+      },
+    };
+  })();
+
+  // --- Feature: middle / ctrl-click an album to open it in a new tab -------
+
+  const albumLinks = (() => {
+    // Albums are <button>s, but the collection page reads ?serie=<name> on load.
+    const albumUrl = (album) => {
+      const name = album.querySelector('.a-name')?.textContent.trim();
+      return name ? `/collection?serie=${encodeURIComponent(name)}` : null;
+    };
+    const albumOf = (e) => e.target.closest?.('ul.albums button.album');
+
+    function onMouseDown(e) {
+      if (e.button === 1 && albumOf(e)) e.preventDefault(); // no autoscroll icon
+    }
+
+    function onAuxClick(e) {
+      if (e.button !== 1) return;
+      const url = albumOf(e) && albumUrl(albumOf(e));
+      if (!url) return;
+      e.preventDefault();
+      window.open(url, '_blank', 'noopener');
+    }
+
+    function onClick(e) {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      const url = albumOf(e) && albumUrl(albumOf(e));
+      if (!url) return;
+      e.preventDefault();
+      e.stopImmediatePropagation(); // keep the site from also opening it here
+      window.open(url, '_blank', 'noopener');
+    }
+
+    return {
+      id: 'albumLinks',
+      label: 'albums en nouvel onglet (clic molette)',
+      start() {
+        document.addEventListener('mousedown', onMouseDown, true);
+        document.addEventListener('auxclick', onAuxClick, true);
+        document.addEventListener('click', onClick, true);
+      },
+      stop() {
+        document.removeEventListener('mousedown', onMouseDown, true);
+        document.removeEventListener('auxclick', onAuxClick, true);
+        document.removeEventListener('click', onClick, true);
+      },
+    };
+  })();
+
   // --- Feature registry & settings -----------------------------------------
 
-  const FEATURES = [priceSort, bgFix, wishlist, tradeUtils, boardFrames, boardQty];
+  const FEATURES = [priceSort, bgFix, wishlist, tradeUtils, boardFrames, boardQty, albumsHide, albumLinks];
   const STORAGE_KEY = 'kmod:features';
   const running = new Set();
 
