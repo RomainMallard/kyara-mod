@@ -1,10 +1,12 @@
 // ==UserScript==
 // @name         Kyara Mod
 // @namespace    kyara-mod
-// @version      0.6.1
+// @version      0.6.2
 // @description  UI tweaks for kyara.games, toggleable from the profile menu.
 // @match        https://kyara.games/*
 // @match        file:///*Kyara*
+// @updateURL    https://raw.githubusercontent.com/RomainMallard/kyara-mod/main/kyara-mod.user.js
+// @downloadURL  https://raw.githubusercontent.com/RomainMallard/kyara-mod/main/kyara-mod.user.js
 // @grant        none
 // ==/UserScript==
 
