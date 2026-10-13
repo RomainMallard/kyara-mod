@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Mod
 // @namespace    kyara-mod
-// @version      0.11.0
+// @version      0.12.0
 // @description  UI tweaks for kyara.games, toggleable from the profile menu.
 // @match        https://kyara.games/*
 // @match        file:///*Kyara*
@@ -579,14 +579,81 @@
     };
   })();
 
-  // --- Feature: hide completed albums ---------------------------------------
+  // --- Album completion part: filters, auto-load, "Plus proches" sort ------
 
   const albumsHide = (() => {
     const BTN_ATTR = 'data-kmod-ah';
+    const SORT_ATTR = 'data-kmod-as';
     const HIDE_CLASS = 'kmod-hide-album';
     const MIN_VISIBLE = 60; // the site's page size
-    let active = false; // remembered until page reload
+    const MIN_SIZE = 5;
     let filling = false;
+
+    let closest = false; // "Plus proches" sort, remembered until page reload
+
+    // "X/Y · N %" meta line -> { owned: X, size: Y }
+    function counts(li) {
+      const m = (li.querySelector('.a-meta')?.textContent || '').match(/(\d+)\s*\/\s*(\d+)/);
+      return m ? { owned: Number(m[1]), size: Number(m[2]) } : { owned: 0, size: 0 };
+    }
+    const size = (li) => counts(li).size;
+
+    // Fewest missing first, completed albums last; ties: smaller album, then name.
+    function sortKey(li) {
+      const { owned, size } = counts(li);
+      const missing = size - owned;
+      return [missing === 0 ? Infinity : missing, size, li.querySelector('.a-name')?.textContent || ''];
+    }
+    function compare(a, b) {
+      return a[0] - b[0] || a[1] - b[1] || a[2].localeCompare(b[2]);
+    }
+
+    // ul.albums is a CSS grid: reorder with `order` instead of moving nodes,
+    // so Svelte's own re-renders can't put them back.
+    function sortAlbums() {
+      [...document.querySelectorAll('ul.albums > li')]
+        .map((li) => ({ li, key: sortKey(li) }))
+        .sort((a, b) => compare(a.key, b.key))
+        .forEach(({ li }, i) => {
+          if (li.style.order !== String(i)) li.style.order = String(i);
+        });
+    }
+
+    function unsortAlbums() {
+      document.querySelectorAll('ul.albums > li').forEach((li) => (li.style.order = ''));
+    }
+
+    // Our button sits in the site's "Trier" group; un-press the site's while ours is on.
+    const siteSortButtons = () =>
+      document.querySelectorAll(`.al-tools .views button:not([${SORT_ATTR}]):not([${BTN_ATTR}] button)`);
+
+    function ensureSortButton() {
+      const group = [...document.querySelectorAll('.al-tools .views')].find((g) => !g.hasAttribute(BTN_ATTR));
+      if (!group || group.querySelector(`[${SORT_ATTR}]`)) return;
+      const siteBtn = group.querySelector('button');
+      const btn = siteBtn ? siteBtn.cloneNode(false) : document.createElement('button');
+      btn.type = 'button';
+      btn.setAttribute(SORT_ATTR, '1');
+      btn.textContent = 'Plus proches';
+      btn.title = 'Trier par cartes manquantes (charge tous les albums)';
+      btn.setAttribute('aria-pressed', String(closest));
+      btn.addEventListener('click', () => {
+        if (closest) return;
+        closest = true;
+        btn.setAttribute('aria-pressed', 'true');
+        siteSortButtons().forEach((b) => b.setAttribute('aria-pressed', 'false'));
+        sortAlbums();
+        fill();
+      });
+      group.append(btn);
+    }
+
+    // keep(li) -> false hides it. `active` is remembered until page reload.
+    const FILTERS = [
+      { key: 'done', label: 'Masquer complets', active: false, keep: (li) => !li.querySelector('.album .done') },
+      { key: 'small', label: `Masquer < ${MIN_SIZE} cartes`, active: false, keep: (li) => size(li) >= MIN_SIZE },
+    ];
+    const anyActive = () => FILTERS.some((f) => f.active);
 
     function ensureStyle() {
       if (document.getElementById('kmod-style-ah')) return;
@@ -596,7 +663,7 @@
       document.head.append(style);
     }
 
-    // Clone the site's sort group so the toggle gets the same look.
+    // Clone the site's sort group so the toggles get the same look.
     function ensureButton() {
       const tools = document.querySelector('.al-tools');
       if (!tools || tools.querySelector(`[${BTN_ATTR}]`)) return;
@@ -605,23 +672,26 @@
       group.setAttribute(BTN_ATTR, '1');
       group.removeAttribute('aria-label');
       const siteBtn = siteGroup?.querySelector('button');
-      const btn = siteBtn ? siteBtn.cloneNode(false) : document.createElement('button');
-      btn.type = 'button';
-      btn.textContent = 'Masquer complets';
-      btn.setAttribute('aria-pressed', String(active));
-      btn.addEventListener('click', () => {
-        active = !active;
-        btn.setAttribute('aria-pressed', String(active));
-        apply();
-        fill();
-      });
-      group.append(btn);
+      for (const f of FILTERS) {
+        const btn = siteBtn ? siteBtn.cloneNode(false) : document.createElement('button');
+        btn.type = 'button';
+        btn.textContent = f.label;
+        btn.setAttribute('aria-pressed', String(f.active));
+        btn.addEventListener('click', () => {
+          f.active = !f.active;
+          btn.setAttribute('aria-pressed', String(f.active));
+          apply();
+          fill();
+        });
+        group.append(btn);
+      }
       tools.append(group);
     }
 
     function apply() {
+      const on = FILTERS.filter((f) => f.active);
       for (const li of document.querySelectorAll('ul.albums > li')) {
-        li.classList.toggle(HIDE_CLASS, active && !!li.querySelector('.album .done'));
+        li.classList.toggle(HIDE_CLASS, on.some((f) => !f.keep(li)));
       }
     }
 
@@ -631,12 +701,15 @@
 
     // Hidden albums leave the page short, and the site only loads more on click:
     // keep clicking "Afficher plus" until a page's worth is visible again.
+    // Sorting needs every album in the DOM, so then load them all.
+    const wantMore = () => closest || (anyActive() && countVisible() < MIN_VISIBLE);
+
     async function fill() {
       if (filling) return;
       filling = true;
       try {
         let btn;
-        while (active && countVisible() < MIN_VISIBLE && (btn = moreButton())) {
+        while (wantMore() && (btn = moreButton())) {
           const before = countAlbums();
           btn.click();
           let grew = false;
@@ -646,22 +719,42 @@
           }
           if (!grew) break; // nothing came, stop
           apply();
+          await sleep(300); // be gentle: each batch pulls in new cover images
         }
       } finally {
         filling = false;
+        if (closest) sortAlbums();
       }
     }
 
+    // Picking one of the site's sorts turns ours off. Svelte only re-sets
+    // aria-pressed when its sort changes, so press the clicked one ourselves.
+    function onDocumentClick(e) {
+      const btn = e.target.closest?.('.al-tools .views button');
+      if (!btn || !closest || btn.hasAttribute(SORT_ATTR) || btn.closest(`[${BTN_ATTR}]`)) return;
+      closest = false;
+      unsortAlbums();
+      document.querySelector(`[${SORT_ATTR}]`)?.setAttribute('aria-pressed', 'false');
+      btn.setAttribute('aria-pressed', 'true');
+    }
+
     return {
-      id: 'albumsHide',
-      label: 'masquer albums complets',
-      start: ensureStyle,
+      start() {
+        ensureStyle();
+        document.addEventListener('click', onDocumentClick, true);
+      },
       tick() {
+        ensureSortButton();
         ensureButton();
         apply(); // re-run: Svelte re-renders on sort / search
-        if (active) fill(); // sort / search resets the list to one page
+        if (wantMore()) fill(); // sort / search resets the list to one page
+        if (closest) sortAlbums(); // also places newly loaded albums
       },
       stop() {
+        closest = false;
+        unsortAlbums();
+        document.querySelector(`[${SORT_ATTR}]`)?.remove();
+        document.removeEventListener('click', onDocumentClick, true);
         document.querySelectorAll(`[${BTN_ATTR}]`).forEach((el) => el.remove());
         document.querySelectorAll(`.${HIDE_CLASS}`).forEach((el) => el.classList.remove(HIDE_CLASS));
         document.getElementById('kmod-style-ah')?.remove();
@@ -669,7 +762,7 @@
     };
   })();
 
-  // --- Feature: middle / ctrl-click an album to open it in a new tab -------
+  // --- Album completion part: middle / ctrl-click opens album in new tab --
 
   const albumLinks = (() => {
     // Albums are <button>s, but the collection page reads ?serie=<name> on load.
@@ -701,8 +794,6 @@
     }
 
     return {
-      id: 'albumLinks',
-      label: 'albums en nouvel onglet (clic molette)',
       start() {
         document.addEventListener('mousedown', onMouseDown, true);
         document.addEventListener('auxclick', onAuxClick, true);
@@ -716,9 +807,25 @@
     };
   })();
 
+  // --- Feature: album completion (filters + "Plus proches" sort + new-tab) --
+
+  const albumCompletion = {
+    id: 'albumCompletion',
+    label: 'album completion',
+    start() {
+      albumsHide.start();
+      albumLinks.start();
+    },
+    tick: () => albumsHide.tick(),
+    stop() {
+      albumsHide.stop();
+      albumLinks.stop();
+    },
+  };
+
   // --- Feature registry & settings -----------------------------------------
 
-  const FEATURES = [priceSort, bgFix, wishlist, tradeUtils, boardFrames, boardQty, albumsHide, albumLinks];
+  const FEATURES = [priceSort, bgFix, wishlist, tradeUtils, boardFrames, boardQty, albumCompletion];
   const STORAGE_KEY = 'kmod:features';
   const running = new Set();
 
