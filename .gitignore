@@ -1,0 +1,8 @@
+# Saved pages from kyara.games (personal data, test fixtures only)
+Kyara — Ma collection.html
+Kyara — Ma collection_files/
+*.html
+*_files/
+
+# Personal learning notes
+.vibe-wise/
