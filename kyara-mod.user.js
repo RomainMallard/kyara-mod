@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Mod
 // @namespace    kyara-mod
-// @version      0.5.1
+// @version      0.6.1
 // @description  UI tweaks for kyara.games, toggleable from the profile menu.
 // @match        https://kyara.games/*
 // @match        file:///*Kyara*
@@ -231,9 +231,118 @@
     };
   })();
 
+  // --- Feature: wishlist heart on missing cards ------------------------------
+
+  const wishlist = (() => {
+    const BTN_ATTR = 'data-kmod-wish';
+    const HEART =
+      '<svg width="16" height="16" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" ' +
+      'aria-hidden="true"><path d="M12 21s-7.5-4.6-9.5-9.2C1.2 8.6 3.3 5 6.8 5c2.1 0 3.6 1.2 ' +
+      '5.2 3 1.6-1.8 3.1-3 5.2-3 3.5 0 5.6 3.6 4.3 6.8C19.5 16.4 12 21 12 21z"/></svg>';
+    let ids = null; // Set of wishlisted card ids; null until bootstrap answers
+    let generation = 0; // bumps on stop() so late responses are ignored
+    const pending = new Set();
+
+    // The site authenticates API calls with a bearer token kept in localStorage.
+    // Read it per request so a refreshed token is picked up.
+    function api(path, method = 'GET') {
+      let token = null;
+      try {
+        token = localStorage.getItem('kyara_token');
+        if (token && token.startsWith('"')) token = JSON.parse(token);
+      } catch {}
+      if (!token) return Promise.reject(new Error('no kyara_token (logged out?)'));
+      return fetch(path, { method, headers: { Authorization: `Bearer ${token}` } });
+    }
+
+    const cardId = (slot) => (slot.getAttribute('href') || '').match(/\/wiki\/(\d+)/)?.[1];
+
+    function paint(btn) {
+      const on = ids.has(Number(btn.getAttribute(BTN_ATTR)));
+      btn.setAttribute('aria-pressed', String(on));
+      btn.title = on ? 'Retirer de la wishlist' : 'Ajouter à la wishlist';
+      btn.style.color = on ? '#ff5c8a' : '#fff';
+      btn.querySelector('svg').setAttribute('fill', on ? 'currentColor' : 'none');
+    }
+
+    const paintAll = () => document.querySelectorAll(`button[${BTN_ATTR}]`).forEach(paint);
+
+    async function toggle(e, btn) {
+      e.preventDefault(); // the button lives inside the a.slot link
+      e.stopPropagation();
+      const id = Number(btn.getAttribute(BTN_ATTR));
+      if (pending.has(id)) return;
+      const gen = generation;
+      const add = !ids.has(id);
+      add ? ids.add(id) : ids.delete(id); // optimistic
+      paintAll();
+      pending.add(id);
+      try {
+        const res = await api(`/api/me/wishlist/${id}`, add ? 'PUT' : 'DELETE');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const list = await res.json().catch(() => null);
+        if (gen !== generation) return;
+        if (Array.isArray(list)) ids = new Set(list.map(Number)); // server is the truth
+      } catch (err) {
+        console.warn(`[kyara-mod] wishlist ${add ? 'PUT' : 'DELETE'} ${id} failed`, err);
+        if (gen !== generation) return;
+        add ? ids.delete(id) : ids.add(id); // revert
+      } finally {
+        pending.delete(id);
+        if (gen === generation) paintAll();
+      }
+    }
+
+    function decorate(slot) {
+      const id = cardId(slot);
+      if (!id) return;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.setAttribute(BTN_ATTR, id);
+      btn.innerHTML = HEART;
+      btn.style.cssText =
+        'position:absolute;top:6px;right:6px;z-index:2;width:28px;height:28px;' +
+        'border-radius:50%;border:none;padding:0;display:flex;align-items:center;' +
+        'justify-content:center;background:rgba(0,0,0,.55);cursor:pointer;';
+      btn.addEventListener('click', (e) => toggle(e, btn));
+      if (getComputedStyle(slot).position === 'static') slot.style.position = 'relative';
+      slot.append(btn);
+      paint(btn);
+    }
+
+    return {
+      id: 'wishlist',
+      label: 'Wishlist sur cartes manquantes',
+      async start() {
+        const gen = generation;
+        try {
+          const res = await api('/api/me/bootstrap');
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const data = await res.json();
+          if (gen === generation) ids = new Set((data.wishlist || []).map(Number));
+        } catch (err) {
+          console.warn('[kyara-mod] wishlist bootstrap failed', err);
+        }
+      },
+      tick() {
+        if (!ids) return; // wait for bootstrap
+        for (const miss of document.querySelectorAll('a.slot div.miss')) {
+          const slot = miss.closest('a.slot');
+          if (!slot.querySelector(`button[${BTN_ATTR}]`)) decorate(slot);
+        }
+      },
+      stop() {
+        generation++;
+        ids = null;
+        pending.clear();
+        document.querySelectorAll(`button[${BTN_ATTR}]`).forEach((b) => b.remove());
+      },
+    };
+  })();
+
   // --- Feature registry & settings -----------------------------------------
 
-  const FEATURES = [priceSort, bgFix];
+  const FEATURES = [priceSort, bgFix, wishlist];
   const STORAGE_KEY = 'kmod:features';
   const running = new Set();
 
