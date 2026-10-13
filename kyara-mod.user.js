@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Mod
 // @namespace    kyara-mod
-// @version      0.12.0
+// @version      0.15.0
 // @description  UI tweaks for kyara.games, toggleable from the profile menu.
 // @match        https://kyara.games/*
 // @match        file:///*Kyara*
@@ -402,7 +402,7 @@
 
     return {
       id: 'tradeUtils',
-      label: 'trade utils',
+      label: 'trade friend',
       start: ensureStyle,
       tick() {
         ensureButtons();
@@ -807,6 +807,118 @@
     };
   })();
 
+  // --- Feature: trade feed (auto-refresh offers by switching market tabs) --
+
+  const boardRefresh = (() => {
+    const BTN_ATTR = 'data-kmod-feed';
+    const PERIOD = 60; // seconds between refreshes
+    let on = false; // opt-in per visit, off after reload
+    let elapsed = 0;
+    let busy = false;
+    let generation = 0;
+
+    const tabs = () => [...document.querySelectorAll('[role="tablist"] button[role="tab"]')];
+    const tab = (label) => tabs().find((b) => b.textContent.trim().startsWith(label));
+    const onTrades = () => tab('Échanges')?.getAttribute('aria-selected') === 'true';
+
+    async function waitFor(cond, ms = 3000) {
+      for (let t = 0; t < ms; t += 100) {
+        if (cond()) return true;
+        await sleep(100);
+      }
+      return false;
+    }
+
+    function label(btn) {
+      btn.textContent = on ? `Flux échanges ● ${PERIOD - elapsed}s` : 'Flux échanges';
+      btn.setAttribute('aria-pressed', String(on));
+      btn.classList.toggle('on', on);
+    }
+
+    function ensureButton() {
+      const head = document.querySelector('section.head');
+      if (!head || !/Le marché/.test(head.querySelector('h1')?.textContent || '')) return null;
+      let btn = head.querySelector(`[${BTN_ATTR}]`);
+      if (btn) return btn;
+      btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'btn btn-ghost btn-sm';
+      btn.setAttribute(BTN_ATTR, '1');
+      btn.title = 'Recharger les offres d’échange toutes les minutes';
+      btn.addEventListener('click', () => {
+        on = !on;
+        elapsed = 0;
+        label(btn);
+      });
+      head.append(btn);
+      return btn;
+    }
+
+    // Leaving the trade tab would wipe what the user is doing: wait instead.
+    const shouldWait = () =>
+      document.hidden ||
+      document.querySelector('.builder') ||
+      document.activeElement?.matches('input, textarea');
+
+    async function refresh() {
+      busy = true;
+      const gen = generation;
+      const y = scrollY;
+      const search = document.querySelector('section.board input[type="search"]')?.value || '';
+      const pills = [...document.querySelectorAll('section.board .filters button.pill.on:not([data-kmod-bq])')]
+        .map((b) => b.textContent.trim());
+      try {
+        tab('Enchères')?.click();
+        if (!(await waitFor(() => !onTrades()))) return;
+        tab('Échanges')?.click();
+        await waitFor(() => onTrades() && document.querySelector('section.board .filters'));
+        if (gen !== generation) return;
+        // Put back search and filters if the site reset them.
+        const input = document.querySelector('section.board input[type="search"]');
+        if (input && input.value !== search) {
+          input.value = search;
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        for (const b of document.querySelectorAll('section.board .filters button.pill:not([data-kmod-bq])')) {
+          if (pills.includes(b.textContent.trim()) && !b.classList.contains('on')) b.click();
+        }
+        await waitFor(() => document.querySelector('ul.offers li.offer'), 2000);
+        scrollTo(0, y);
+      } finally {
+        busy = false;
+      }
+    }
+
+    // The site re-fetches offers itself after "Donner …": restart the countdown.
+    function onClick(e) {
+      if (e.target.closest?.('button')?.textContent.trim().startsWith('Donner ')) elapsed = 0;
+    }
+
+    return {
+      id: 'boardRefresh',
+      label: 'flux échanges (marché)',
+      start() {
+        document.addEventListener('click', onClick, true);
+      },
+      tick() {
+        const btn = ensureButton();
+        if (!btn || !on || busy) return;
+        if (onTrades() && elapsed < PERIOD) elapsed++;
+        if (elapsed >= PERIOD && onTrades() && !shouldWait()) {
+          elapsed = 0;
+          refresh();
+        }
+        label(btn);
+      },
+      stop() {
+        generation++;
+        on = false;
+        document.removeEventListener('click', onClick, true);
+        document.querySelectorAll(`[${BTN_ATTR}]`).forEach((el) => el.remove());
+      },
+    };
+  })();
+
   // --- Feature: album completion (filters + "Plus proches" sort + new-tab) --
 
   const albumCompletion = {
@@ -823,9 +935,27 @@
     },
   };
 
+  // --- Feature groups: several features under one toggle -------------------
+
+  function group(id, label, parts) {
+    const each = (method) => {
+      for (const f of parts) {
+        try {
+          f[method]?.();
+        } catch (err) {
+          console.error(`[kyara-mod] ${f.id}.${method} failed`, err);
+        }
+      }
+    };
+    return { id, label, start: () => each('start'), tick: () => each('tick'), stop: () => each('stop') };
+  }
+
+  const browsingUtils = group('browsingUtils', 'browsing utils', [bgFix, wishlist]);
+  const tradeMarket = group('tradeMarket', 'trade market', [boardFrames, boardQty, boardRefresh]);
+
   // --- Feature registry & settings -----------------------------------------
 
-  const FEATURES = [priceSort, bgFix, wishlist, tradeUtils, boardFrames, boardQty, albumCompletion];
+  const FEATURES = [priceSort, browsingUtils, tradeUtils, tradeMarket, albumCompletion];
   const STORAGE_KEY = 'kmod:features';
   const running = new Set();
 
