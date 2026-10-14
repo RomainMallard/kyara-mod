@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Mod
 // @namespace    kyara-mod
-// @version      0.15.0
+// @version      0.15.2
 // @description  UI tweaks for kyara.games, toggleable from the profile menu.
 // @match        https://kyara.games/*
 // @match        file:///*Kyara*
@@ -811,7 +811,7 @@
 
   const boardRefresh = (() => {
     const BTN_ATTR = 'data-kmod-feed';
-    const PERIOD = 60; // seconds between refreshes
+    const PERIOD = 30; // seconds between refreshes
     let on = false; // opt-in per visit, off after reload
     let elapsed = 0;
     let busy = false;
@@ -844,12 +844,15 @@
       btn.type = 'button';
       btn.className = 'btn btn-ghost btn-sm';
       btn.setAttribute(BTN_ATTR, '1');
-      btn.title = 'Recharger les offres d’échange toutes les minutes';
+      // btn-ghost text is near-invisible on this header: match the title color.
+      btn.style.color = getComputedStyle(head.querySelector('h1')).color;
+      btn.title = 'Recharger les offres d’échange toutes les 30 secondes';
       btn.addEventListener('click', () => {
         on = !on;
         elapsed = 0;
         label(btn);
       });
+      label(btn);
       head.append(btn);
       return btn;
     }
