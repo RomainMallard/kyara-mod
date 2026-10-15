@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Mod
 // @namespace    kyara-mod
-// @version      0.15.2
+// @version      0.19.0
 // @description  UI tweaks for kyara.games, toggleable from the profile menu.
 // @match        https://kyara.games/*
 // @match        file:///*Kyara*
@@ -342,38 +342,80 @@
     };
   })();
 
-  // --- Feature: trade utils (dialog filters: doubles, missing) ---------------
+  // --- Feature: trade utils (dialog filters: doubles, missing for friend) ----
 
   const tradeUtils = (() => {
     const BTN_ATTR = 'data-kmod-tf';
     const HIDE_CLASS = 'kmod-hide';
+    // Old markup: .builder with .qty and a button.toggle.
+    // New markup (site update): .shelf with .have ("×2 dispo") and .chips of button.only.
+    const ROOT = ':is(.builder, .shelf)';
 
     function qty(tile) {
-      const m = (tile.querySelector('.qty')?.textContent || '').match(/(\d+)/);
+      const m = (tile.querySelector('.qty, .have')?.textContent || '').match(/(\d+)/);
       return m ? Number(m[1]) : 0;
     }
 
     // keep(tile) -> false hides it. A tile shows only if every active filter keeps it.
     // `active` is remembered across dialog opens until page reload.
+    // Friend's tradable cards (GET /api/trades/available/<uuid>), fetched on dialog open.
+    // Absent from the list = we treat it as missing for them.
+    let friendIds = null; // Set of characterIds; null until loaded / on failure
+    let loadedFor = null; // uuid the current fetch belongs to; null = dialog closed
+    const friendUuid = () => new URLSearchParams(location.search).get('avec');
+    const cardId = (tile) => Number(tile.querySelector('img')?.getAttribute('src')?.match(/(\d+)\.webp/)?.[1]);
+    const onMyTab = () =>
+      /^\s*Mes cartes/.test(document.querySelector(`${ROOT} [role="tab"][aria-selected="true"]`)?.textContent || '');
+
+    async function loadFriend(uuid) {
+      try {
+        const res = await api(`/api/trades/available/${uuid}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const list = await res.json();
+        if (loadedFor === uuid) friendIds = new Set(list.map((c) => Number(c.characterId)));
+      } catch (err) {
+        console.warn('[kyara-mod] friend cards fetch failed', err);
+      }
+    }
+
+    // Dialog just opened (root appeared) or friend changed: fetch their list.
+    function watchDialog() {
+      const uuid = document.querySelector(ROOT) ? friendUuid() : null;
+      if (uuid === loadedFor) return;
+      loadedFor = uuid;
+      friendIds = null;
+      if (uuid) loadFriend(uuid);
+    }
+
+    // `mine` filters only apply (and show) on the "Mes cartes" tab.
     const FILTERS = [
       { key: 'dbl', label: 'Doubles ×2+', active: false, keep: (t) => qty(t) >= 2 },
-      { key: 'miss', label: 'Manquantes', active: false, keep: (t) => !!t.querySelector('.flag.f-miss') },
+      {
+        key: 'lack',
+        label: 'Il lui manque',
+        mine: true,
+        active: false,
+        keep: (t) => !friendIds || !friendIds.has(cardId(t)), // not loaded -> keep all
+      },
     ];
 
     function ensureStyle() {
       if (document.getElementById('kmod-style-tf')) return;
       const style = document.createElement('style');
       style.id = 'kmod-style-tf';
-      style.textContent = `.builder .grid .tile.${HIDE_CLASS}{display:none!important}`;
+      style.textContent = `${ROOT} .grid .${HIDE_CLASS}{display:none!important}`;
       document.head.append(style);
     }
 
-    // Clone the site's "Échangeables" toggle so ours get the same look.
+    // Clone a site toggle ("Échangeables" or a chip) so ours get the same look.
     function ensureButtons() {
-      const filters = document.querySelector('.builder .filters');
+      const filters = document.querySelector(`${ROOT} .filters`);
       if (!filters || filters.querySelector(`[${BTN_ATTR}]`)) return;
-      const siteToggle = filters.querySelector(`button.toggle:not([${BTN_ATTR}])`);
-      let anchor = siteToggle;
+      const chips = filters.querySelector('.chips');
+      const siteToggle =
+        filters.querySelector(`button.toggle:not([${BTN_ATTR}])`) ||
+        chips?.querySelector(`button.only:not([${BTN_ATTR}])`);
+      let anchor = filters.querySelector(`button.toggle:not([${BTN_ATTR}])`);
       for (const f of FILTERS) {
         const btn = siteToggle ? siteToggle.cloneNode(false) : document.createElement('button');
         btn.type = 'button';
@@ -388,15 +430,20 @@
           apply();
         });
         if (anchor) anchor.after(btn);
+        else if (chips) chips.append(btn);
         else filters.append(btn);
         anchor = btn;
       }
     }
 
     function apply() {
-      const on = FILTERS.filter((f) => f.active);
-      for (const tile of document.querySelectorAll('.builder .grid .tile')) {
-        tile.classList.toggle(HIDE_CLASS, on.some((f) => !f.keep(tile)));
+      const mine = onMyTab();
+      for (const b of document.querySelectorAll(`[${BTN_ATTR}="lack"]`)) b.hidden = !mine;
+      const on = FILTERS.filter((f) => f.active && (!f.mine || mine));
+      for (const tile of document.querySelectorAll(`${ROOT} .grid .tile`)) {
+        // New markup wraps each tile in an <li> grid cell: hide that, or a gap remains.
+        const cell = tile.closest(`${ROOT} .grid > li`) || tile;
+        cell.classList.toggle(HIDE_CLASS, on.some((f) => !f.keep(tile)));
       }
     }
 
@@ -405,10 +452,12 @@
       label: 'trade friend',
       start: ensureStyle,
       tick() {
+        watchDialog();
         ensureButtons();
         apply(); // re-run: Svelte swaps tiles on tab change / search
       },
       stop() {
+        loadedFor = friendIds = null;
         document.querySelectorAll(`[${BTN_ATTR}]`).forEach((b) => b.remove());
         document.querySelectorAll(`.${HIDE_CLASS}`).forEach((t) => t.classList.remove(HIDE_CLASS));
         document.getElementById('kmod-style-tf')?.remove();
@@ -483,7 +532,12 @@
     let qtys = null; // Map characterId -> qty; null until loaded
     let ticks = 0;
     let generation = 0;
-    let onlyDoubles = false; // remembered until page reload
+    // Pills: keep offers whose requested card we own at least `min` times.
+    // `active` is remembered until page reload; the highest active `min` wins.
+    const PILLS = [
+      { min: 2, label: 'Doubles à donner', title: 'Masquer les offres où tu n’as aucune carte demandée en ×2 ou plus', active: false },
+      { min: 3, label: 'Triples à donner', title: 'Masquer les offres où tu n’as aucune carte demandée en ×3 ou plus', active: false },
+    ];
 
     async function load() {
       const gen = generation;
@@ -518,20 +572,22 @@
       const filters = document.querySelector('section.board .filters');
       if (!filters || filters.querySelector(`[${BTN_ATTR}]`)) return;
       const sitePill = filters.querySelector(`button.pill:not([${BTN_ATTR}])`);
-      const btn = sitePill ? sitePill.cloneNode(false) : document.createElement('button');
-      btn.type = 'button';
-      btn.setAttribute(BTN_ATTR, '1');
-      btn.textContent = 'Doubles à donner';
-      btn.title = 'Masquer les offres où tu n’as aucune carte demandée en ×2 ou plus';
-      btn.setAttribute('aria-pressed', String(onlyDoubles));
-      btn.classList.toggle('on', onlyDoubles);
-      btn.addEventListener('click', () => {
-        onlyDoubles = !onlyDoubles;
-        btn.setAttribute('aria-pressed', String(onlyDoubles));
-        btn.classList.toggle('on', onlyDoubles);
-        apply();
-      });
-      filters.append(btn);
+      for (const p of PILLS) {
+        const btn = sitePill ? sitePill.cloneNode(false) : document.createElement('button');
+        btn.type = 'button';
+        btn.setAttribute(BTN_ATTR, String(p.min));
+        btn.textContent = p.label;
+        btn.title = p.title;
+        btn.setAttribute('aria-pressed', String(p.active));
+        btn.classList.toggle('on', p.active);
+        btn.addEventListener('click', () => {
+          p.active = !p.active;
+          btn.setAttribute('aria-pressed', String(p.active));
+          btn.classList.toggle('on', p.active);
+          apply();
+        });
+        filters.append(btn);
+      }
     }
 
     function apply() {
@@ -549,8 +605,9 @@
         }
         if (badge.textContent !== `×${n}`) badge.textContent = `×${n}`;
       }
+      const min = Math.max(0, ...PILLS.filter((p) => p.active).map((p) => p.min));
       for (const li of document.querySelectorAll('ul.offers li.offer')) {
-        const hide = onlyDoubles && ![...li.querySelectorAll('a.thumb')].some((a) => qtyOf(a) >= 2);
+        const hide = min > 0 && ![...li.querySelectorAll('a.thumb')].some((a) => qtyOf(a) >= min);
         li.classList.toggle(HIDE_CLASS, hide);
       }
     }
@@ -838,22 +895,35 @@
     function ensureButton() {
       const head = document.querySelector('section.head');
       if (!head || !/Le marché/.test(head.querySelector('h1')?.textContent || '')) return null;
-      let btn = head.querySelector(`[${BTN_ATTR}]`);
+      let btn = head.querySelector(`[${BTN_ATTR}="1"]`);
       if (btn) return btn;
-      btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'btn btn-ghost btn-sm';
-      btn.setAttribute(BTN_ATTR, '1');
       // btn-ghost text is near-invisible on this header: match the title color.
-      btn.style.color = getComputedStyle(head.querySelector('h1')).color;
-      btn.title = 'Recharger les offres d’échange toutes les 30 secondes';
+      const color = getComputedStyle(head.querySelector('h1')).color;
+      const make = (value, title) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'btn btn-ghost btn-sm';
+        b.setAttribute(BTN_ATTR, value);
+        b.style.color = color;
+        b.title = title;
+        return b;
+      };
+      btn = make('1', 'Recharger les offres d’échange toutes les 30 secondes');
       btn.addEventListener('click', () => {
         on = !on;
         elapsed = 0;
         label(btn);
       });
       label(btn);
-      head.append(btn);
+      const now = make('reload', 'Recharger les offres maintenant');
+      now.textContent = '↻';
+      now.addEventListener('click', () => {
+        if (busy || !onTrades() || shouldWait()) return;
+        elapsed = 0;
+        label(btn);
+        refresh();
+      });
+      head.append(btn, now);
       return btn;
     }
 
