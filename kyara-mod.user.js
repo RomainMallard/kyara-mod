@@ -1094,12 +1094,51 @@
       return null;
     }
 
+    // "Auto-acceptables" pill: hide offers no auto-accept rule matches.
+    const PILL_ATTR = 'data-kmod-aa';
+    const HIDE_CLASS = 'kmod-hide-aa';
+    let onlyAcceptable = false; // remembered until page reload
+
+    function ensureFilter() {
+      if (!document.getElementById('kmod-style-aa')) {
+        const style = document.createElement('style');
+        style.id = 'kmod-style-aa';
+        style.textContent = `ul.offers li.offer.${HIDE_CLASS}{display:none!important}`;
+        document.head.append(style);
+      }
+      const filters = document.querySelector('section.board .filters');
+      if (!filters || filters.querySelector(`[${PILL_ATTR}]`)) return;
+      const sitePill = filters.querySelector('button.pill:not([data-kmod-bq])');
+      const pill = sitePill ? sitePill.cloneNode(false) : document.createElement('button');
+      pill.type = 'button';
+      pill.setAttribute(PILL_ATTR, '1');
+      pill.textContent = 'Auto-acceptables';
+      pill.title = 'Ne montrer que les offres que l’auto-accept accepterait';
+      const sync = () => {
+        pill.setAttribute('aria-pressed', String(onlyAcceptable));
+        pill.classList.toggle('on', onlyAcceptable);
+      };
+      pill.addEventListener('click', () => {
+        onlyAcceptable = !onlyAcceptable;
+        sync();
+        applyFilter();
+      });
+      sync();
+      filters.append(pill);
+    }
+
+    function applyFilter() {
+      for (const li of document.querySelectorAll('ul.offers li.offer')) {
+        li.classList.toggle(HIDE_CLASS, onlyAcceptable && !acceptable(li));
+      }
+    }
+
     async function autoAccept(gen) {
       // Offers already clicked this run: skip them if an accept failed and
       // the offer stayed on the board, so we never loop on it.
       const tried = new Set();
       for (let done = 0; ; done++) {
-        await jitter(1500, 5000); // look like a human reading the board
+        await jitter(250, 750); // look like a human reading the board
         if (gen !== generation || !auto || !onTrades() || shouldWait()) return;
         // Re-scan each time: the site re-renders offers after an accept.
         const hit = [...document.querySelectorAll('ul.offers li.offer')]
@@ -1107,7 +1146,7 @@
           .map(acceptable)
           .find(Boolean);
         if (!hit) {
-          console.info(`[kyara-mod] auto-accept: no matching offer (${done} accepted this refresh)`);
+          console.info(`[kyara-mod] auto-accept: no more matching offers (${done} tried this refresh)`);
           return;
         }
         const { btn, rule } = hit;
@@ -1132,6 +1171,10 @@
       },
       tick() {
         const btn = ensureButton();
+        if (btn) {
+          ensureFilter();
+          applyFilter(); // re-run: Svelte re-renders offers on search / filter
+        }
         if (!btn || !on || busy) return;
         if (onTrades() && elapsed < PERIOD) elapsed++;
         if (elapsed >= PERIOD && onTrades() && !shouldWait()) {
@@ -1142,9 +1185,11 @@
       },
       stop() {
         generation++;
-        on = auto = false;
+        on = auto = onlyAcceptable = false;
         document.removeEventListener('click', onClick, true);
-        document.querySelectorAll(`[${BTN_ATTR}]`).forEach((el) => el.remove());
+        document.querySelectorAll(`[${BTN_ATTR}], [${PILL_ATTR}]`).forEach((el) => el.remove());
+        document.querySelectorAll(`.${HIDE_CLASS}`).forEach((el) => el.classList.remove(HIDE_CLASS));
+        document.getElementById('kmod-style-aa')?.remove();
       },
     };
   })();
