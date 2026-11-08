@@ -19,14 +19,19 @@
 
   // The site authenticates API calls with a bearer token kept in localStorage.
   // Read it per request so a refreshed token is picked up.
-  function api(path, method = 'GET') {
+  function api(path, method = 'GET', body) {
     let token = null;
+    let device = null;
     try {
       token = localStorage.getItem('kyara_token');
       if (token && token.startsWith('"')) token = JSON.parse(token);
+      device = localStorage.getItem('kyara_device'); // the site sends it as x-device-id
     } catch { }
     if (!token) return Promise.reject(new Error('no kyara_token (logged out?)'));
-    return fetch(path, { method, headers: { Authorization: `Bearer ${token}` } });
+    const headers = { Authorization: `Bearer ${token}` };
+    if (device) headers['x-device-id'] = device;
+    if (body !== undefined) headers['Content-Type'] = 'application/json';
+    return fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
   }
 
   // The site's nav also has a "div.more" ("Plus" menu), so match by text too.
@@ -599,6 +604,7 @@
     const HIDE_CLASS = 'kmod-hide-offer';
     const REFRESH_TICKS = 60; // re-fetch the collection about once a minute
     let qtys = null; // Map characterId -> qty; null until loaded
+    let free = null; // Map characterId -> copies free to trade
     let ticks = 0;
     let generation = 0;
     // Pills: keep offers whose requested card we own at least `min` times.
@@ -616,7 +622,11 @@
         const data = await res.json();
         // Expect an array; tolerate it being wrapped in an object.
         const list = Array.isArray(data) ? data : Object.values(data).find(Array.isArray) || [];
-        if (gen === generation) qtys = new Map(list.map((c) => [Number(c.characterId), c.qty || 0]));
+        if (gen === generation) {
+          qtys = new Map(list.map((c) => [Number(c.characterId), c.qty || 0]));
+          // Copies free to trade (not listed on the market); the site checks this.
+          free = new Map(list.map((c) => [Number(c.characterId), c.listable ?? c.qty ?? 0]));
+        }
       } catch (err) {
         console.warn('[kyara-mod] collection fetch failed', err);
       }
@@ -691,6 +701,17 @@
       },
       // Shared with boardRefresh's auto-accept.
       qtyOf: (a) => (qtys ? qtyOf(a) : null),
+      // By id, for API offers: null until the collection is loaded.
+      qtyById: (id) => (qtys ? qtys.get(Number(id)) || 0 : null),
+      freeById: (id) => (free ? free.get(Number(id)) || 0 : null),
+      // After an accept, without waiting for the next reload.
+      traded(gotId, gaveId) {
+        if (!qtys) return;
+        for (const m of [qtys, free]) {
+          m.set(Number(gotId), (m.get(Number(gotId)) || 0) + 1);
+          m.set(Number(gaveId), Math.max(0, (m.get(Number(gaveId)) || 0) - 1));
+        }
+      },
       reload: load,
       tick() {
         if (++ticks % REFRESH_TICKS === 0) load(); // pick up trades / boosters
@@ -700,7 +721,7 @@
       },
       stop() {
         generation++;
-        qtys = null;
+        qtys = free = null;
         document.querySelectorAll(`[${BADGE_ATTR}], [${BTN_ATTR}]`).forEach((el) => el.remove());
         document.querySelectorAll(`.${HIDE_CLASS}`).forEach((el) => el.classList.remove(HIDE_CLASS));
         document.getElementById('kmod-style-bq')?.remove();
@@ -1023,6 +1044,9 @@
       const pills = [...document.querySelectorAll('section.board .filters button.pill.on:not([data-kmod-bq])')]
         .map((b) => b.textContent.trim());
       try {
+        // Accept first, through the API, so the reloaded board shows the result.
+        if (auto) await autoAccept(gen);
+        if (gen !== generation) return;
         tab('Enchères')?.click();
         if (!(await waitFor(() => !onTrades()))) return;
         tab('Échanges')?.click();
@@ -1039,7 +1063,6 @@
         }
         await waitFor(() => document.querySelector('ul.offers li.offer'), 2000);
         scrollTo(0, y);
-        if (auto) await autoAccept(gen);
       } finally {
         busy = false;
       }
@@ -1133,28 +1156,124 @@
       }
     }
 
+    // --- API side: scan every page of offers, not only what the board shows ---
+    const PAGE_SIZE = 20; // what the site itself asks for
+    const MAX_PAGES = 100; // safety cap per refresh
+    // Rarity keys as the catalog may spell them, lowest tier first.
+    const TIER_KEYS = [
+      ['common', 'commune', 'c'],
+      ['uncommon', 'peu_commune', 'peu commune', 'uc'],
+      ['rare', 'r'],
+      ['epic', 'epique', 'épique', 'e'],
+      ['legendary', 'legendaire', 'légendaire', 'l'],
+      ['mythic', 'mythique', 'm'],
+    ];
+    let catalog = null; // Map characterId -> { name, tier }
+    const unknownRarities = new Set();
+
+    function tierOf(rarity) {
+      if (typeof rarity === 'number') return rarity;
+      const key = String(rarity ?? '').toLowerCase();
+      const i = TIER_KEYS.findIndex((keys) => keys.includes(key));
+      if (i < 0 && !unknownRarities.has(key)) {
+        unknownRarities.add(key);
+        console.warn('[kyara-mod] auto-accept: unknown rarity', rarity);
+      }
+      return i;
+    }
+
+    async function loadCatalog() {
+      if (catalog) return catalog;
+      const res = await api('/api/characters');
+      if (!res.ok) throw new Error(`characters: HTTP ${res.status}`);
+      const data = await res.json();
+      const list = Array.isArray(data) ? data : Object.values(data).find(Array.isArray) || [];
+      catalog = new Map(list.map((c) => [Number(c.id), { name: c.name, tier: tierOf(c.rarity) }]));
+      return catalog;
+    }
+
+    // First rule matching this offer, with the card to give.
+    function match(offer) {
+      const got = boardQty.qtyById(offer.characterId);
+      const r = catalog.get(Number(offer.characterId))?.tier ?? -1;
+      if (got == null || r < 0) return null;
+      for (const wantId of offer.wantIds || []) {
+        if (!boardQty.freeById(wantId)) continue; // none free to give
+        const have = boardQty.qtyById(wantId);
+        const g = catalog.get(Number(wantId))?.tier ?? -1;
+        if (g < 0) continue;
+        const rule = RULES.find((x) => x.ok({ got, have, r, g }));
+        if (rule) return { withId: wantId, rule: rule.name };
+      }
+      return null;
+    }
+
+    // Offers already judged, so a refresh only reads the new ones at the top
+    // (newest first). A full sweep now and then forgets them all: our
+    // collection changes (boosters, trades), so an old offer can start to match.
+    const FULL_SWEEP_MS = 30 * 60 * 1000;
+    const checked = new Set();
+    let lastFull = 0;
+
+    // Accept as soon as a match is found, while the offer is fresh.
     async function autoAccept(gen) {
-      // Offers already clicked this run: skip them if an accept failed and
-      // the offer stayed on the board, so we never loop on it.
-      const tried = new Set();
-      for (let done = 0; ; done++) {
-        await jitter(250, 750); // look like a human reading the board
-        if (gen !== generation || !auto || !onTrades() || shouldWait()) return;
-        // Re-scan each time: the site re-renders offers after an accept.
-        const hit = [...document.querySelectorAll('ul.offers li.offer')]
-          .filter((li) => !tried.has(li.id))
-          .map(acceptable)
-          .find(Boolean);
-        if (!hit) {
-          console.info(`[kyara-mod] auto-accept: no more matching offers (${done} tried this refresh)`);
-          return;
+      const stillOn = () => gen === generation && auto && onTrades() && !shouldWait();
+      let accepted = 0;
+      let closed = 0;
+      let seen = 0;
+      let fresh = 0;
+      let pages = 0;
+      const full = Date.now() - lastFull > FULL_SWEEP_MS;
+      try {
+        await loadCatalog();
+        if (boardQty.qtyById(0) == null) await boardQty.reload();
+        if (full) checked.clear();
+        for (let page = 1; page <= MAX_PAGES; page++) {
+          if (!stillOn()) return;
+          const res = await api(`/api/trades/offers/search?takeable=1&page=${page}&pageSize=${PAGE_SIZE}`);
+          if (!res.ok) throw new Error(`offers page ${page}: HTTP ${res.status}`);
+          const { items = [], more } = await res.json();
+          pages++;
+          seen += items.length;
+          const news = items.filter((o) => !checked.has(o.id));
+          fresh += news.length;
+          news.forEach((o) => checked.add(o.id));
+          // Caught up: everything from here down was judged on an earlier pass.
+          if (!full && items.length && !news.length) break;
+          for (const offer of news) {
+            const hit = match(offer);
+            if (!hit) continue;
+            await jitter(250, 750);
+            if (!stillOn()) return;
+            const name = (id) => catalog.get(Number(id))?.name ?? id;
+            const res2 = await api(`/api/trades/offers/${encodeURIComponent(offer.id)}/accept`, 'POST', {
+              withId: hit.withId,
+            });
+            if (res2.ok) {
+              accepted++;
+              boardQty.traded(offer.characterId, hit.withId);
+              elapsed = 0;
+              console.info(`[kyara-mod] auto-accept (${hit.rule}): got ${name(offer.characterId)}, gave ${name(hit.withId)}`);
+            } else {
+              const err = await res2.json().catch(() => ({}));
+              if (err.error === 'offer_closed') closed++;
+              else console.warn(`[kyara-mod] auto-accept: ${offer.id} refused`, res2.status, err);
+            }
+          }
+          if (!more) {
+            if (full) lastFull = Date.now(); // only a sweep that reached the end counts
+            break;
+          }
+          await jitter(300, 900); // pace the page requests
         }
-        const { btn, rule } = hit;
-        tried.add(btn.closest('li.offer')?.id);
-        console.info(`[kyara-mod] auto-accept (${rule}):`, btn.closest('li.offer')?.id, btn.textContent.trim());
-        btn.click();
-        await jitter(2000, 4000);
-        await boardQty.reload(); // fresh quantities before judging the next one
+      } catch (err) {
+        console.warn('[kyara-mod] auto-accept failed', err);
+      } finally {
+        console.info(
+          `[kyara-mod] auto-accept (${full ? 'full sweep' : 'new only'}): ${pages} pages, ` +
+            `${seen} offers read, ${fresh} new, ${accepted} accepted, ${closed} already closed`,
+        );
+        if (accepted) boardQty.reload();
       }
     }
 
