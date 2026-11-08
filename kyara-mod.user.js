@@ -34,6 +34,39 @@
     return fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
   }
 
+  // Card catalog (GET /api/characters), loaded once and shared.
+  // Rarity codes, lowest tier first, as the site's own table lists them.
+  const RARITIES = ['C', 'U', 'R', 'E', 'L', 'M'];
+  let charactersPromise = null;
+  function characters() {
+    charactersPromise ||= (async () => {
+      const res = await api('/api/characters');
+      if (!res.ok) throw new Error(`characters: HTTP ${res.status}`);
+      const data = await res.json();
+      const list = Array.isArray(data) ? data : Object.values(data).find(Array.isArray) || [];
+      // Map characterId -> { name, rarity, tier } (tier -1 if unknown)
+      return new Map(
+        list.map((c) => [
+          Number(c.id),
+          { name: c.name, rarity: c.rarity, tier: RARITIES.indexOf(String(c.rarity ?? '').toUpperCase()) },
+        ]),
+      );
+    })().catch((err) => {
+      charactersPromise = null; // retry on next call
+      throw err;
+    });
+    return charactersPromise;
+  }
+
+  // Our collection: Map characterId -> { qty, free } (free = not on the market).
+  async function myCollection() {
+    const res = await api('/api/me/collection?lean=1');
+    if (!res.ok) throw new Error(`collection: HTTP ${res.status}`);
+    const data = await res.json();
+    const list = Array.isArray(data) ? data : Object.values(data).find(Array.isArray) || [];
+    return new Map(list.map((c) => [Number(c.characterId), { qty: c.qty || 0, free: c.listable ?? c.qty ?? 0 }]));
+  }
+
   // The site's nav also has a "div.more" ("Plus" menu), so match by text too.
   const isMoreButton = (el) =>
     el && !el.dataset.kmod && el.textContent.trim().startsWith('Afficher plus');
@@ -436,7 +469,11 @@
     // Absent from the list = we treat it as missing for them.
     let friendIds = null; // Set of characterIds; null until loaded / on failure
     let loadedFor = null; // uuid the current fetch belongs to; null = dialog closed
-    const friendUuid = () => new URLSearchParams(location.search).get('avec');
+    // From the friends page (?avec=<uuid>) or the friend's profile (/profil/<uuid>).
+    const friendUuid = () =>
+      new URLSearchParams(location.search).get('avec') ||
+      location.pathname.match(/^\/profil\/([0-9a-f-]{36})/i)?.[1] ||
+      null;
     const cardId = (tile) => Number(tile.querySelector('img')?.getAttribute('src')?.match(/(\d+)\.webp/)?.[1]);
     const onMyTab = () =>
       /^\s*Mes cartes/.test(document.querySelector(`${ROOT} [role="tab"][aria-selected="true"]`)?.textContent || '');
@@ -521,6 +558,255 @@
       }
     }
 
+    // --- Auto-fill: pick doubles on both sides and click them into the trays ---
+    const FILL_ATTR = 'data-kmod-fill';
+    const MAX_CARDS = 20; // per side, the site's limit
+    let filling = false;
+
+    // Fair-play values (◆), as the dialog's totals use them. 200 ids per call.
+    async function prices(ids) {
+      const out = new Map();
+      for (let i = 0; i < ids.length; i += 200) {
+        const res = await api(`/api/fair-play/prices?ids=${ids.slice(i, i + 200).join(',')}`);
+        if (!res.ok) throw new Error(`prices: HTTP ${res.status}`);
+        for (const [id, p] of Object.entries(await res.json())) out.set(Number(id), Number(p) || 0);
+      }
+      return out;
+    }
+
+    // Proposals not answered yet still count: cards on their way out are
+    // already spoken for, cards on their way in are as good as owned.
+    // Otherwise each auto-fill would pick the same cards again.
+    async function applyPending(uuid, mine, avail, owned) {
+      const [meRes, tradesRes] = await Promise.all([api('/api/me'), api('/api/me/trades')]);
+      if (!meRes.ok || !tradesRes.ok) {
+        console.warn('[kyara-mod] auto-fill: pending trades not checked', meRes.status, tradesRes.status);
+        return;
+      }
+      const me = await meRes.json();
+      const data = await tradesRes.json();
+      // { incoming: [...], outgoing: [...] }: take every list, not just the first.
+      const trades = Array.isArray(data) ? data : Object.values(data).filter(Array.isArray).flat();
+      const idOf = (u) => u?.id ?? u?.uuid ?? u;
+      // In a trade with this friend, we're the side that isn't them; this
+      // also tells us our own id for trades with other players.
+      const withFriend = trades.find((t) => idOf(t.from) === uuid || idOf(t.to) === uuid);
+      const meId =
+        me.id ?? me.user?.id ?? me.uuid ??
+        (withFriend && (idOf(withFriend.from) === uuid ? idOf(withFriend.to) : idOf(withFriend.from)));
+      console.debug('[kyara-mod] auto-fill: me', meId, 'trades', trades);
+      const cards = (side) => side?.cards || [];
+      let n = 0;
+      for (const t of trades) {
+        if (String(t.status).toLowerCase() !== 'pending') continue;
+        n++;
+        const iSent = idOf(t.to) === uuid || (meId != null && idOf(t.from) === meId);
+        const out = cards(iSent ? t.give : t.want); // leaves my collection
+        const inc = cards(iSent ? t.want : t.give); // comes to me
+        for (const c of out) {
+          const m = mine.get(Number(c.characterId));
+          if (m) {
+            m.qty -= c.qty || 1;
+            m.free -= c.qty || 1;
+          }
+        }
+        for (const c of inc) {
+          const id = Number(c.characterId);
+          const m = mine.get(id) || { qty: 0, free: 0 };
+          m.qty += c.qty || 1; // no longer missing for me
+          mine.set(id, m);
+        }
+        // With this friend: their side moves the other way.
+        const other = iSent ? idOf(t.to) : idOf(t.from);
+        if (other === uuid) {
+          for (const c of inc) {
+            const id = Number(c.characterId);
+            avail.set(id, (avail.get(id) || 0) - (c.qty || 1));
+          }
+          for (const c of out) owned.add(Number(c.characterId));
+        }
+      }
+      if (n) console.info(`[kyara-mod] auto-fill: ${n} pending trade(s) taken into account`);
+    }
+
+    // Cards each side can give: a double the other one doesn't own.
+    async function candidates(uuid) {
+      const [cat, mine, availRes, ownedRes] = await Promise.all([
+        characters(),
+        myCollection(),
+        api(`/api/trades/available/${uuid}`),
+        api(`/api/trades/owned/${uuid}`),
+      ]);
+      if (!availRes.ok) throw new Error(`friend cards: HTTP ${availRes.status}`);
+      const avail = new Map((await availRes.json()).map((c) => [Number(c.characterId), c.n || 0]));
+      // Everything they own; fall back to their tradable list if refused.
+      const owned = ownedRes.ok ? new Set((await ownedRes.json()).map(Number)) : new Set(avail.keys());
+      await applyPending(uuid, mine, avail, owned);
+      const card = (id) => ({ id, ...cat.get(id) });
+      const give = [...mine]
+        .filter(([id, c]) => c.qty >= 2 && c.free >= 1 && !owned.has(id))
+        .map(([id]) => card(id));
+      const get = [...avail]
+        .filter(([id, n]) => n >= 2 && !(mine.get(id)?.qty > 0))
+        .map(([id]) => card(id));
+      const ok = (c) => c.name && c.tier >= 0;
+      const all = [...give, ...get].filter(ok);
+      const value = await prices(all.map((c) => c.id));
+      for (const c of all) c.price = value.get(c.id) ?? 0;
+      return { give: give.filter(ok), get: get.filter(ok) };
+    }
+
+    // Same rarity, one for one. Sorted by value on both sides, so each pair
+    // is as close in value as possible; the closest pairs are kept.
+    function pickSameRarity({ give, get }) {
+      const pairs = [];
+      for (let t = 0; t < RARITIES.length; t++) {
+        const a = give.filter((c) => c.tier === t).sort((x, y) => y.price - x.price);
+        const b = get.filter((c) => c.tier === t).sort((x, y) => y.price - x.price);
+        for (let i = 0; i < Math.min(a.length, b.length); i++) pairs.push([a[i], b[i]]);
+      }
+      pairs.sort((p, q) => Math.abs(p[0].price - p[1].price) - Math.abs(q[0].price - q[1].price));
+      const kept = pairs.slice(0, MAX_CARDS);
+      return { give: kept.map((p) => p[0]), get: kept.map((p) => p[1]) };
+    }
+
+    // Any rarity, totals as close as possible: most valuable cards first,
+    // always adding to the lighter side, then one last card to close the gap.
+    function pickByValue({ give, get }) {
+      const a = [...give].sort((x, y) => y.price - x.price);
+      const b = [...get].sort((x, y) => y.price - x.price);
+      const out = { give: [], get: [] };
+      const sum = (l) => l.reduce((s, c) => s + c.price, 0);
+      while (out.give.length < MAX_CARDS && out.get.length < MAX_CARDS) {
+        const lighter = sum(out.give) <= sum(out.get) ? 'give' : 'get';
+        const pool = lighter === 'give' ? a : b;
+        if (!pool.length) break;
+        out[lighter].push(pool.shift());
+      }
+      // Fewer cards on one side: the heavier side may have overshot. Add the
+      // card that best closes the gap, if it helps.
+      const gap = sum(out.give) - sum(out.get);
+      const side = gap > 0 ? 'get' : 'give';
+      const pool = side === 'give' ? a : b;
+      if (gap && out[side].length < MAX_CARDS && pool.length) {
+        const best = pool.reduce((m, c) => (Math.abs(Math.abs(gap) - c.price) < Math.abs(Math.abs(gap) - m.price) ? c : m));
+        if (Math.abs(Math.abs(gap) - best.price) < Math.abs(gap)) out[side].push(best);
+      }
+      // Never propose a one-sided trade.
+      if (!out.give.length || !out.get.length) return { give: [], get: [] };
+      return out;
+    }
+
+    const shelf = () => document.querySelector(`${ROOT}`);
+    const waitFor = async (cond, ms = 3000) => {
+      for (let t = 0; t < ms; t += 100) {
+        const v = cond();
+        if (v) return v;
+        await sleep(100);
+      }
+      return null;
+    };
+
+    // Switch the shelf tab, and turn off the site's filters there so every
+    // card can show up in a search.
+    async function openTab(mineTab) {
+      const tabs = [...document.querySelectorAll(`${ROOT} [role="tab"]`)];
+      const tab = tabs.find((t) => /^\s*Mes cartes/.test(t.textContent) === mineTab);
+      if (tab && tab.getAttribute('aria-selected') !== 'true') {
+        tab.click();
+        await waitFor(() => tab.getAttribute('aria-selected') === 'true');
+      }
+      for (const b of document.querySelectorAll(`${ROOT} .chips button.only:not([${BTN_ATTR}])`)) {
+        if (b.getAttribute('aria-pressed') === 'true') b.click();
+      }
+      const all = document.querySelector(`${ROOT} .chips[role="group"] button.chip`); // "Toutes"
+      if (all && all.getAttribute('aria-pressed') !== 'true') all.click();
+      await sleep(200);
+    }
+
+    function search(text) {
+      const input = document.querySelector(`${ROOT} .filters input[type="search"]`);
+      if (!input) return;
+      input.value = text;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    async function addCard(c) {
+      search(c.name);
+      const tile = await waitFor(() =>
+        [...document.querySelectorAll(`${ROOT} .grid .tile`)].find((t) => cardId(t) === c.id),
+      );
+      if (!tile) {
+        console.warn('[kyara-mod] auto-fill: tile not found', c.name, c.id);
+        return false;
+      }
+      tile.click();
+      await sleep(150);
+      return true;
+    }
+
+    async function fill(pick, btn) {
+      if (filling) return;
+      const uuid = friendUuid();
+      if (!uuid) return;
+      filling = true;
+      const label = btn.textContent;
+      btn.textContent = '…';
+      try {
+        const chosen = pick(await candidates(uuid));
+        if (!chosen.give.length) {
+          alert('Aucun échange de doubles possible avec cet ami.');
+          return;
+        }
+        // Empty both trays first.
+        for (const slot of document.querySelectorAll('.trays button.slot')) {
+          slot.click();
+          await sleep(50);
+        }
+        const missed = [];
+        await openTab(true);
+        for (const c of chosen.give) if (!(await addCard(c))) missed.push(c.name);
+        await openTab(false);
+        for (const c of chosen.get) if (!(await addCard(c))) missed.push(c.name);
+        search('');
+        const total = (l) => l.reduce((s, c) => s + c.price, 0);
+        console.info(
+          `[kyara-mod] auto-fill: give ${chosen.give.length} (≈${total(chosen.give)} ◆), ` +
+            `get ${chosen.get.length} (≈${total(chosen.get)} ◆)`,
+        );
+        if (missed.length) alert(`Cartes introuvables dans la liste : ${missed.join(', ')}`);
+      } catch (err) {
+        console.warn('[kyara-mod] auto-fill failed', err);
+        alert(`Remplissage auto impossible : ${err.message}`);
+      } finally {
+        btn.textContent = label;
+        filling = false;
+      }
+    }
+
+    function ensureFillButtons() {
+      const filters = document.querySelector(`${ROOT} .filters`);
+      if (!filters || filters.querySelector(`[${FILL_ATTR}]`) || !friendUuid()) return;
+      const site = filters.querySelector(`.chips button.only:not([${BTN_ATTR}])`);
+      const box = document.createElement('div');
+      box.className = 'chips';
+      box.setAttribute(FILL_ATTR, '1');
+      for (const [text, title, pick] of [
+        ['Auto : même rareté', 'Remplir l’échange : tes doubles qui lui manquent contre ses doubles qui te manquent, de même rareté', pickSameRarity],
+        ['Auto : valeur ≈', 'Remplir l’échange : doubles de toutes raretés, valeurs totales aussi proches que possible', pickByValue],
+      ]) {
+        const b = site ? site.cloneNode(false) : document.createElement('button');
+        b.type = 'button';
+        b.classList.remove('on');
+        b.setAttribute('aria-pressed', 'false');
+        b.textContent = text;
+        b.title = title;
+        b.addEventListener('click', () => fill(pick, b));
+        box.append(b);
+      }
+      filters.append(box);
+    }
+
     return {
       id: 'tradeUtils',
       label: 'trade friend',
@@ -528,10 +814,12 @@
       tick() {
         watchDialog();
         ensureButtons();
+        ensureFillButtons();
         apply(); // re-run: Svelte swaps tiles on tab change / search
       },
       stop() {
         loadedFor = friendIds = null;
+        document.querySelectorAll(`[${FILL_ATTR}]`).forEach((b) => b.remove());
         document.querySelectorAll(`[${BTN_ATTR}]`).forEach((b) => b.remove());
         document.querySelectorAll(`.${HIDE_CLASS}`).forEach((t) => t.classList.remove(HIDE_CLASS));
         document.getElementById('kmod-style-tf')?.remove();
@@ -1161,36 +1449,10 @@
     // --- API side: scan every page of offers, not only what the board shows ---
     const PAGE_SIZE = 20; // what the site itself asks for
     const MAX_PAGES = 100; // safety cap per refresh
-    // Rarity keys as the catalog may spell them, lowest tier first.
-    const TIER_KEYS = [
-      ['common', 'commune', 'c'],
-      ['uncommon', 'peu_commune', 'peu commune', 'uc'],
-      ['rare', 'r'],
-      ['epic', 'epique', 'épique', 'e'],
-      ['legendary', 'legendaire', 'légendaire', 'l'],
-      ['mythic', 'mythique', 'm'],
-    ];
-    let catalog = null; // Map characterId -> { name, tier }
-    const unknownRarities = new Set();
-
-    function tierOf(rarity) {
-      if (typeof rarity === 'number') return rarity;
-      const key = String(rarity ?? '').toLowerCase();
-      const i = TIER_KEYS.findIndex((keys) => keys.includes(key));
-      if (i < 0 && !unknownRarities.has(key)) {
-        unknownRarities.add(key);
-        console.warn('[kyara-mod] auto-accept: unknown rarity', rarity);
-      }
-      return i;
-    }
+    let catalog = null; // shared characters() map, set by loadCatalog()
 
     async function loadCatalog() {
-      if (catalog) return catalog;
-      const res = await api('/api/characters');
-      if (!res.ok) throw new Error(`characters: HTTP ${res.status}`);
-      const data = await res.json();
-      const list = Array.isArray(data) ? data : Object.values(data).find(Array.isArray) || [];
-      catalog = new Map(list.map((c) => [Number(c.id), { name: c.name, tier: tierOf(c.rarity) }]));
+      catalog = await characters();
       return catalog;
     }
 
