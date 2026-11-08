@@ -1,6 +1,6 @@
-# Saved pages from kyara.games (personal data, test fixtures only)
-Kyara — Ma collection.html
-Kyara — Ma collection_files/
+# Saved pages from kyara.games (personal data, test fixtures only),
+# grouped by feature under snapshots/<feature>/
+snapshots/
 *.html
 *_files/
 
