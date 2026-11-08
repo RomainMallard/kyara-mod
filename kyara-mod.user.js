@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Mod
 // @namespace    kyara-mod
-// @version      0.19.0
+// @version      0.20.0
 // @description  UI tweaks for kyara.games, toggleable from the profile menu.
 // @match        https://kyara.games/*
 // @match        file:///*Kyara*
@@ -24,9 +24,24 @@
     try {
       token = localStorage.getItem('kyara_token');
       if (token && token.startsWith('"')) token = JSON.parse(token);
-    } catch {}
+    } catch { }
     if (!token) return Promise.reject(new Error('no kyara_token (logged out?)'));
     return fetch(path, { method, headers: { Authorization: `Bearer ${token}` } });
+  }
+
+  // The site's nav also has a "div.more" ("Plus" menu), so match by text too.
+  const isMoreButton = (el) =>
+    el && !el.dataset.kmod && el.textContent.trim().startsWith('Afficher plus');
+  const moreButton = () => [...document.querySelectorAll('div.more > button')].find(isMoreButton);
+  const countCells = () => document.querySelectorAll('div.grid > div.cell').length;
+
+  // Resolve once the card count exceeds `before` (or after timeoutMs).
+  async function waitForMoreCells(before, timeoutMs = 5000) {
+    for (let t = 0; t < timeoutMs; t += 100) {
+      if (countCells() > before) return true;
+      await sleep(100);
+    }
+    return false;
   }
 
   function findTriSelect() {
@@ -79,21 +94,6 @@
     function resortIfActive() {
       const opt = activeOption();
       if (opt) sortGrid(opt.dir);
-    }
-
-    // The site's nav also has a "div.more" ("Plus" menu), so match by text too.
-    const isMoreButton = (el) =>
-      el && !el.dataset.kmod && el.textContent.trim().startsWith('Afficher plus');
-    const moreButton = () => [...document.querySelectorAll('div.more > button')].find(isMoreButton);
-    const countCells = () => document.querySelectorAll('div.grid > div.cell').length;
-
-    // Resolve once the card count exceeds `before` (or after timeoutMs).
-    async function waitForMoreCells(before, timeoutMs = 5000) {
-      for (let t = 0; t < timeoutMs; t += 100) {
-        if (countCells() > before) return true;
-        await sleep(100);
-      }
-      return false;
     }
 
     // Select "change": let Svelte's own handler run first, then apply our order.
@@ -249,6 +249,7 @@
 
   const wishlist = (() => {
     const BTN_ATTR = 'data-kmod-wish';
+    const ALL_ATTR = 'data-kmod-wishall';
     const HEART =
       '<svg width="16" height="16" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" ' +
       'aria-hidden="true"><path d="M12 21s-7.5-4.6-9.5-9.2C1.2 8.6 3.3 5 6.8 5c2.1 0 3.6 1.2 ' +
@@ -295,6 +296,72 @@
       }
     }
 
+    // "♥ Manquantes": load every card, then wishlist all missing ones not yet wishlisted.
+    async function wishAllMissing(ourBtn) {
+      if (!ids) return;
+      const gen = generation;
+      const label = ourBtn.textContent;
+      ourBtn.disabled = true;
+      try {
+        ourBtn.textContent = 'Chargement…';
+        let more;
+        while ((more = moreButton())) {
+          const before = countCells();
+          more.click();
+          if (!(await waitForMoreCells(before))) break;
+          await sleep(300);
+        }
+        const todo = [
+          ...new Set(
+            [...document.querySelectorAll('a.slot div.miss')]
+              .map((m) => Number(cardId(m.closest('a.slot'))))
+              .filter((id) => id && !ids.has(id)),
+          ),
+        ];
+        if (!todo.length) return void alert('Toutes les cartes manquantes affichées sont déjà dans la wishlist.');
+        if (!confirm(`Ajouter ${todo.length} carte(s) manquante(s) à la wishlist ?`)) return;
+        let done = 0;
+        let failed = 0;
+        for (const id of todo) {
+          if (gen !== generation) return; // feature turned off mid-run
+          ourBtn.textContent = `♥ ${done + failed}/${todo.length}`;
+          try {
+            const res = await api(`/api/me/wishlist/${id}`, 'PUT');
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const list = await res.json().catch(() => null);
+            if (Array.isArray(list)) ids = new Set(list.map(Number));
+            else ids.add(id);
+            done++;
+          } catch (err) {
+            failed++;
+            console.warn(`[kyara-mod] wishlist PUT ${id} failed`, err);
+          }
+          paintAll();
+          await sleep(150); // don't hammer the API
+        }
+        if (failed) alert(`${done} ajoutée(s), ${failed} échec(s) (voir la console).`);
+      } finally {
+        ourBtn.disabled = false;
+        ourBtn.textContent = label;
+      }
+    }
+
+    function ensureWishAllButton() {
+      const select = findTriSelect();
+      const label = select && select.closest('label');
+      if (!label || label.parentElement.querySelector(`button[${ALL_ATTR}]`)) return;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'btn btn-ghost';
+      btn.setAttribute(ALL_ATTR, '1');
+      btn.textContent = '♥ Manquantes';
+      btn.title = 'Ajouter toutes les cartes manquantes (filtres actuels) à la wishlist';
+      btn.style.marginLeft = '8px';
+      btn.style.alignSelf = 'flex-end';
+      btn.addEventListener('click', () => wishAllMissing(btn));
+      label.parentElement.append(btn);
+    }
+
     function decorate(slot) {
       const id = cardId(slot);
       if (!id) return;
@@ -328,6 +395,7 @@
       },
       tick() {
         if (!ids) return; // wait for bootstrap
+        ensureWishAllButton();
         for (const miss of document.querySelectorAll('a.slot div.miss')) {
           const slot = miss.closest('a.slot');
           if (!slot.querySelector(`button[${BTN_ATTR}]`)) decorate(slot);
@@ -338,6 +406,7 @@
         ids = null;
         pending.clear();
         document.querySelectorAll(`button[${BTN_ATTR}]`).forEach((b) => b.remove());
+        document.querySelectorAll(`button[${ALL_ATTR}]`).forEach((b) => b.remove());
       },
     };
   })();
@@ -620,6 +689,9 @@
         ticks = 0;
         load();
       },
+      // Shared with boardRefresh's auto-accept.
+      qtyOf: (a) => (qtys ? qtyOf(a) : null),
+      reload: load,
       tick() {
         if (++ticks % REFRESH_TICKS === 0) load(); // pick up trades / boosters
         if (!qtys) return;
@@ -868,7 +940,7 @@
 
   const boardRefresh = (() => {
     const BTN_ATTR = 'data-kmod-feed';
-    const PERIOD = 30; // seconds between refreshes
+    const PERIOD = 10; // seconds between refreshes
     let on = false; // opt-in per visit, off after reload
     let elapsed = 0;
     let busy = false;
@@ -923,7 +995,17 @@
         label(btn);
         refresh();
       });
-      head.append(btn, now);
+      const autoBtn = make('auto', 'À chaque rechargement, accepter les offres : double contre carte manquante, ×3+ contre carte en ×1 (même rareté), ou double contre rareté supérieure');
+      const autoLabel = () => {
+        autoBtn.textContent = auto ? 'Auto-accept ●' : 'Auto-accept';
+        autoBtn.setAttribute('aria-pressed', String(auto));
+      };
+      autoBtn.addEventListener('click', () => {
+        auto = !auto;
+        autoLabel();
+      });
+      autoLabel();
+      head.append(btn, now, autoBtn);
       return btn;
     }
 
@@ -957,8 +1039,83 @@
         }
         await waitFor(() => document.querySelector('ul.offers li.offer'), 2000);
         scrollTo(0, y);
+        if (auto) await autoAccept(gen);
       } finally {
         busy = false;
+      }
+    }
+
+    // --- Auto-accept: give a double for a missing card of the same rarity ---
+    let auto = false; // opt-in per visit, off after reload
+    const jitter = (min, max) => sleep(min + Math.random() * (max - min));
+    const rarity = (img) => img?.style.boxShadow.match(/rgba?\([^)]*\)|#[0-9a-f]{3,8}/i)?.[0] || null;
+    // Frame colours from the site's rarity filter, lowest tier first.
+    const TIERS = [
+      'rgb(181, 177, 187)', // Commune
+      'rgb(63, 191, 127)', // Peu commune
+      'rgb(77, 155, 255)', // Rare
+      'rgb(176, 114, 255)', // Épique
+      'rgb(245, 197, 24)', // Légendaire
+      'rgb(255, 77, 46)', // Mythique
+    ];
+    const tier = (img) => TIERS.indexOf(rarity(img)); // -1 if unknown
+
+    // got / have: how many copies we own of the received / given card;
+    // r / g: their tiers. Every rule gives only a card we hold several of.
+    const RULES = [
+      { name: 'manquante', ok: (o) => o.got === 0 && o.have >= 2 && o.r === o.g },
+      { name: '×1 contre ×3+', ok: (o) => o.got === 1 && o.have >= 3 && o.r === o.g },
+      { name: 'rareté supérieure', ok: (o) => o.have >= 2 && o.r > o.g },
+    ];
+
+    // The offer's "Donner X" button, if it gives one of our doubles (same
+    // rarity) for a card we don't own yet.
+    function acceptable(li) {
+      const big = li.querySelector('a.big');
+      const got = big && boardQty.qtyOf(big);
+      if (got == null) return null; // collection not loaded yet
+      const r = tier(big.querySelector('img'));
+      if (r < 0) return null;
+      const thumbs = [...li.querySelectorAll('a.thumb')];
+      // One "Donner <name> <span>×N</span>" button per card we could give:
+      // read the name from the button's own text, not the count span.
+      for (const btn of li.querySelectorAll('.acts button')) {
+        const text = [...btn.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent).join('').trim();
+        if (!text.startsWith('Donner ')) continue;
+        const name = text.slice('Donner '.length).trim();
+        const give = thumbs.find((a) => a.querySelector('img')?.alt.trim() === name);
+        if (!give) continue;
+        const have = boardQty.qtyOf(give) ?? 0;
+        const g = tier(give.querySelector('img'));
+        if (g < 0) continue;
+        const rule = RULES.find((x) => x.ok({ got, have, r, g }));
+        if (rule) return { btn, rule: rule.name };
+      }
+      return null;
+    }
+
+    async function autoAccept(gen) {
+      // Offers already clicked this run: skip them if an accept failed and
+      // the offer stayed on the board, so we never loop on it.
+      const tried = new Set();
+      for (let done = 0; ; done++) {
+        await jitter(1500, 5000); // look like a human reading the board
+        if (gen !== generation || !auto || !onTrades() || shouldWait()) return;
+        // Re-scan each time: the site re-renders offers after an accept.
+        const hit = [...document.querySelectorAll('ul.offers li.offer')]
+          .filter((li) => !tried.has(li.id))
+          .map(acceptable)
+          .find(Boolean);
+        if (!hit) {
+          console.info(`[kyara-mod] auto-accept: no matching offer (${done} accepted this refresh)`);
+          return;
+        }
+        const { btn, rule } = hit;
+        tried.add(btn.closest('li.offer')?.id);
+        console.info(`[kyara-mod] auto-accept (${rule}):`, btn.closest('li.offer')?.id, btn.textContent.trim());
+        btn.click();
+        await jitter(2000, 4000);
+        await boardQty.reload(); // fresh quantities before judging the next one
       }
     }
 
@@ -985,7 +1142,7 @@
       },
       stop() {
         generation++;
-        on = false;
+        on = auto = false;
         document.removeEventListener('click', onClick, true);
         document.querySelectorAll(`[${BTN_ATTR}]`).forEach((el) => el.remove());
       },
