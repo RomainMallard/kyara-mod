@@ -1071,6 +1071,8 @@
     // --- Auto-accept: give a double for a missing card of the same rarity ---
     let auto = false; // opt-in per visit, off after reload
     const jitter = (min, max) => sleep(min + Math.random() * (max - min));
+    // Local time as HH:MM:SS, to date auto-accept log lines.
+    const clock = () => new Date().toTimeString().slice(0, 8);
     const rarity = (img) => img?.style.boxShadow.match(/rgba?\([^)]*\)|#[0-9a-f]{3,8}/i)?.[0] || null;
     // Frame colours from the site's rarity filter, lowest tier first.
     const TIERS = [
@@ -1253,11 +1255,11 @@
               accepted++;
               boardQty.traded(offer.characterId, hit.withId);
               elapsed = 0;
-              console.info(`[kyara-mod] auto-accept (${hit.rule}): got ${name(offer.characterId)}, gave ${name(hit.withId)}`);
+              console.info(`[kyara-mod] ${clock()} auto-accept (${hit.rule}): got ${name(offer.characterId)}, gave ${name(hit.withId)}`);
             } else {
               const err = await res2.json().catch(() => ({}));
               if (err.error === 'offer_closed') closed++;
-              else console.warn(`[kyara-mod] auto-accept: ${offer.id} refused`, res2.status, err);
+              else console.warn(`[kyara-mod] ${clock()} auto-accept: ${offer.id} refused`, res2.status, err);
             }
           }
           if (!more) {
@@ -1270,7 +1272,7 @@
         console.warn('[kyara-mod] auto-accept failed', err);
       } finally {
         console.info(
-          `[kyara-mod] auto-accept (${full ? 'full sweep' : 'new only'}): ${pages} pages, ` +
+          `[kyara-mod] ${clock()} auto-accept (${full ? 'full sweep' : 'new only'}): ${pages} pages, ` +
             `${seen} offers read, ${fresh} new, ${accepted} accepted, ${closed} already closed`,
         );
         if (accepted) boardQty.reload();
