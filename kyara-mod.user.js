@@ -501,6 +501,7 @@
     // `mine` filters only apply (and show) on the "Mes cartes" tab.
     const FILTERS = [
       { key: 'dbl', label: 'Doubles ×2+', active: false, keep: (t) => qty(t) >= 2 },
+      { key: 'tri', label: 'Triples ×3+', active: false, keep: (t) => qty(t) >= 3 },
       {
         key: 'lack',
         label: 'Il lui manque',
@@ -629,8 +630,12 @@
       if (n) console.info(`[kyara-mod] auto-fill: ${n} pending trade(s) taken into account`);
     }
 
-    // Cards each side can give: a double the other one doesn't own.
-    async function candidates(uuid) {
+    // Cards each side can give, by mode:
+    // - 'missing': a double (x2+) the other one doesn't own;
+    // - 'stack': a card held x3+ that the other one has fewer than 2 of, so
+    //   the giver keeps a double and the receiver gains a card (a double if
+    //   they had one).
+    async function candidates(uuid, mode = 'missing') {
       const [cat, mine, availRes, ownedRes] = await Promise.all([
         characters(),
         myCollection(),
@@ -643,11 +648,15 @@
       const owned = ownedRes.ok ? new Set((await ownedRes.json()).map(Number)) : new Set(avail.keys());
       await applyPending(uuid, mine, avail, owned);
       const card = (id) => ({ id, ...cat.get(id) });
+      const myQty = (id) => mine.get(id)?.qty || 0;
+      // Their exact count is unknown: owned + tradable copies is the best guess.
+      const theirQty = (id) => (owned.has(id) ? Math.max(1, avail.get(id) || 0) : 0);
+      const [min, lacks] = mode === 'stack' ? [3, (q) => q < 2] : [2, (q) => q === 0];
       const give = [...mine]
-        .filter(([id, c]) => c.qty >= 2 && c.free >= 1 && !owned.has(id))
+        .filter(([id, c]) => c.qty >= min && c.free >= 1 && lacks(theirQty(id)))
         .map(([id]) => card(id));
       const get = [...avail]
-        .filter(([id, n]) => n >= 2 && !(mine.get(id)?.qty > 0))
+        .filter(([id, n]) => n >= min && lacks(myQty(id)))
         .map(([id]) => card(id));
       const ok = (c) => c.name && c.tier >= 0;
       const all = [...give, ...get].filter(ok);
@@ -745,7 +754,7 @@
       return true;
     }
 
-    async function fill(pick, btn) {
+    async function fill(pick, btn, mode) {
       if (filling) return;
       const uuid = friendUuid();
       if (!uuid) return;
@@ -753,7 +762,7 @@
       const label = btn.textContent;
       btn.textContent = '…';
       try {
-        const chosen = pick(await candidates(uuid));
+        const chosen = pick(await candidates(uuid, mode));
         if (!chosen.give.length) {
           alert('Aucun échange de doubles possible avec cet ami.');
           return;
@@ -791,9 +800,10 @@
       const box = document.createElement('div');
       box.className = 'chips';
       box.setAttribute(FILL_ATTR, '1');
-      for (const [text, title, pick] of [
+      for (const [text, title, pick, mode] of [
         ['Auto : même rareté', 'Remplir l’échange : tes doubles qui lui manquent contre ses doubles qui te manquent, de même rareté', pickSameRarity],
         ['Auto : valeur ≈', 'Remplir l’échange : doubles de toutes raretés, valeurs totales aussi proches que possible', pickByValue],
+        ['Auto : ×3+ → doubles', 'Remplir l’échange : cartes en ×3+ d’un côté qui sont en ×0 ou ×1 de l’autre, valeurs totales aussi proches que possible. Chacun garde ses doubles et en gagne.', pickByValue, 'stack'],
       ]) {
         const b = site ? site.cloneNode(false) : document.createElement('button');
         b.type = 'button';
@@ -801,7 +811,7 @@
         b.setAttribute('aria-pressed', 'false');
         b.textContent = text;
         b.title = title;
-        b.addEventListener('click', () => fill(pick, b));
+        b.addEventListener('click', () => fill(pick, b, mode));
         box.append(b);
       }
       filters.append(box);
